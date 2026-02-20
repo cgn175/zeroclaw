@@ -7659,7 +7659,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw"
-version = "0.1.0"
+version = "0.1.1-a2a"
 dependencies = [
  "anyhow",
  "async-imap",

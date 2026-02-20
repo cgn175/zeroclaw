@@ -12,6 +12,19 @@ const SCREENSHOT_TIMEOUT_SECS: u64 = 15;
 /// Maximum base64 payload size to return (2 MB of base64 ≈ 1.5 MB image).
 const MAX_BASE64_BYTES: usize = 2_097_152;
 
+/// Truncate a string to at most `max_bytes` bytes, ensuring we don't split a UTF-8 character.
+fn truncate_to_char_boundary(s: &mut String, max_bytes: usize) {
+    if s.len() <= max_bytes {
+        return;
+    }
+    // Find the last valid char boundary at or before max_bytes
+    let mut boundary = max_bytes;
+    while !s.is_char_boundary(boundary) && boundary > 0 {
+        boundary -= 1;
+    }
+    s.truncate(boundary);
+}
+
 /// Tool for capturing screenshots using platform-native commands.
 ///
 /// macOS: `screencapture`
@@ -173,7 +186,7 @@ impl ScreenshotTool {
                 let size = bytes.len();
                 let mut encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 let truncated = if encoded.len() > MAX_BASE64_BYTES {
-                    encoded.truncate(encoded.floor_char_boundary(MAX_BASE64_BYTES));
+                    truncate_to_char_boundary(&mut encoded, MAX_BASE64_BYTES);
                     true
                 } else {
                     false

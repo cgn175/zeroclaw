@@ -45,13 +45,5 @@ pub mod pairing;
 pub mod processor;
 pub mod protocol;
 
-pub use channel::{
-    calculate_backoff_delay, A2AChannel, PeerConnection, PeerState, ReconnectConfig,
-};
-pub use pairing::{
-    complete_pairing, exchange_pairing_code, generate_pairing_code, initiate_peer_pairing,
-    is_tls_required, verify_pairing_code, PairingConfirmRequest, PairingConfirmResponse,
-    PairingManager, PairingRequest, PairingRequestResponse,
-};
-pub use processor::process_a2a_message;
-pub use protocol::{A2AConfig, A2AMessage, A2APeer};
+pub use channel::A2AChannel;
+pub use protocol::A2AMessage;

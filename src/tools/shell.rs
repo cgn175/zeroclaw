@@ -16,6 +16,19 @@ const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
+/// Truncate a string to at most `max_bytes` bytes, ensuring we don't split a UTF-8 character.
+fn truncate_to_char_boundary(s: &mut String, max_bytes: usize) {
+    if s.len() <= max_bytes {
+        return;
+    }
+    // Find the last valid char boundary at or before max_bytes
+    let mut boundary = max_bytes;
+    while !s.is_char_boundary(boundary) && boundary > 0 {
+        boundary -= 1;
+    }
+    s.truncate(boundary);
+}
+
 /// Shell command execution tool with sandboxing
 pub struct ShellTool {
     security: Arc<SecurityPolicy>,
@@ -127,11 +140,11 @@ impl Tool for ShellTool {
 
                 // Truncate output to prevent OOM
                 if stdout.len() > MAX_OUTPUT_BYTES {
-                    stdout.truncate(stdout.floor_char_boundary(MAX_OUTPUT_BYTES));
+                    truncate_to_char_boundary(&mut stdout, MAX_OUTPUT_BYTES);
                     stdout.push_str("\n... [output truncated at 1MB]");
                 }
                 if stderr.len() > MAX_OUTPUT_BYTES {
-                    stderr.truncate(stderr.floor_char_boundary(MAX_OUTPUT_BYTES));
+                    truncate_to_char_boundary(&mut stderr, MAX_OUTPUT_BYTES);
                     stderr.push_str("\n... [stderr truncated at 1MB]");
                 }
 

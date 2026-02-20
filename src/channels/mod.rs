@@ -37,7 +37,7 @@ pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
 
-pub use a2a::{A2AChannel, A2AConfig, A2AMessage, A2APeer};
+pub use a2a::A2AChannel;
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
 pub use discord::DiscordChannel;
