@@ -1,25 +1,28 @@
 //! A2A (Agent-to-Agent) Channel
 //!
 //! This module provides agent-to-agent communication capabilities for ZeroClaw,
-//! enabling secure, authenticated messaging between peer agents over HTTP.
+//! enabling secure, authenticated messaging between peer agents using the
+//! Google A2A protocol standard.
 //!
 //! # Overview
 //!
-//! The A2A channel implements a simple request/response protocol where agents
-//! can exchange messages using bearer token authentication. The protocol
-//! supports:
+//! The A2A channel implements the Google A2A protocol (https://github.com/google/A2A)
+//! for interoperable agent-to-agent communication. The protocol supports:
 //!
-//! - Session-based conversation threading
-//! - Reply chains for structured dialogues
+//! - Task-based workflow (create, get, stream, cancel)
+//! - Agent Card discovery at /.well-known/agent.json
+//! - SSE streaming for real-time task updates
+//! - Bearer token authentication
 //! - Static peer configuration (deny-by-default security model)
-//! - Configurable listen port and access controls
 //! - Secure peer pairing with short-lived pairing codes
 //!
 //! # Protocol Types
 //!
 //! See [`protocol`] for the core message types:
 //!
-//! - [`A2AMessage`](protocol::A2AMessage) - Message envelope
+//! - [`AgentCard`](protocol::AgentCard) - Agent discovery document
+//! - [`Task`](protocol::Task) - Unit of work
+//! - [`TaskMessage`](protocol::TaskMessage) - Messages within a task
 //! - [`A2APeer`](protocol::A2APeer) - Peer configuration
 //! - [`A2AConfig`](protocol::A2AConfig) - Channel configuration
 //!
@@ -46,4 +49,3 @@ pub mod processor;
 pub mod protocol;
 
 pub use channel::A2AChannel;
-pub use protocol::A2AMessage;

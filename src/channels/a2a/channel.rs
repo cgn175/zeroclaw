@@ -18,7 +18,7 @@
 //! - Maximum retries: 10
 //! - HTTP client timeout: 30s
 
-use super::protocol::{A2AConfig, A2AMessage, A2APeer, CreateTaskRequest};
+use super::protocol::{A2AConfig, A2APeer, CreateTaskRequest};
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -250,19 +250,6 @@ impl A2AChannel {
     fn peer_task_stream_url(peer: &A2APeer, task_id: &str) -> String {
         let base = peer.endpoint.trim_end_matches('/');
         format!("{}/tasks/{}/stream", base, task_id)
-    }
-
-    /// Legacy: Build the full URL for a peer's send endpoint.
-    #[deprecated(note = "Use peer_tasks_url instead")]
-    fn peer_send_url(peer: &A2APeer) -> String {
-        Self::peer_tasks_url(peer)
-    }
-
-    /// Legacy: Build the full URL for a peer's SSE endpoint.
-    #[deprecated(note = "Use peer_task_stream_url instead")]
-    fn peer_sse_url(peer: &A2APeer) -> String {
-        let base = peer.endpoint.trim_end_matches('/');
-        format!("{}/a2a/events", base)
     }
 
     /// Calculate exponential backoff delay for reconnection.

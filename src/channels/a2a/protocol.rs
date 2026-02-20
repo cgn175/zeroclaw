@@ -653,53 +653,6 @@ fn current_timestamp_secs() -> u64 {
 }
 
 // =============================================================================
-// Legacy Types (for migration)
-// =============================================================================
-
-/// Legacy message type - deprecated, use Task instead.
-///
-/// This type is kept for backward compatibility during migration.
-#[deprecated(since = "0.4.0", note = "Use Task and TaskMessage instead")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct A2AMessage {
-    /// Unique message identifier.
-    pub id: String,
-    /// Conversation thread identifier.
-    pub session_id: String,
-    /// Sender peer identifier.
-    pub sender_id: String,
-    /// Recipient peer identifier.
-    pub recipient_id: String,
-    /// Message content.
-    pub content: String,
-    /// Unix timestamp.
-    pub timestamp: u64,
-    /// Optional parent message ID.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reply_to: Option<String>,
-}
-
-impl A2AMessage {
-    /// Create a new A2A message.
-    #[allow(deprecated)]
-    pub fn new(
-        session_id: impl Into<String>,
-        sender_id: impl Into<String>,
-        recipient_id: impl Into<String>,
-        content: impl Into<String>,
-    ) -> Self {
-        Self {
-            id: uuid::Uuid::new_v4().to_string(),
-            session_id: session_id.into(),
-            sender_id: sender_id.into(),
-            recipient_id: recipient_id.into(),
-            content: content.into(),
-            timestamp: current_timestamp_secs(),
-            reply_to: None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
