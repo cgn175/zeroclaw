@@ -1,9 +1,40 @@
 # A2A Protocol Migration to Google A2A Standard
 
-**Status:** Planning  
-**Created:** 2026-02-20  
+**Status:** COMPLETED  
+**Completed:** 2026-02-20  
+**Commit:** d11a14b  
 **Target:** Migrate from custom A2A protocol to Google's A2A open standard  
 **Scope:** Core protocol types and endpoints only (no backward compatibility)
+
+## Implementation Summary
+
+### What Was Implemented
+
+1. **Protocol Types** (`src/channels/a2a/protocol.rs`):
+   - `AgentCard` - Agent discovery document at `/.well-known/agent.json`
+   - `Task` - Primary unit of work with status (pending/running/completed/failed)
+   - `TaskMessage` - Messages within tasks (user/agent roles)
+   - `Artifact` - Files, images, binary content
+   - `TaskUpdate` - SSE events for streaming
+   - Request/Response types: `CreateTaskRequest`, `GetTaskRequest`, `CancelTaskRequest`
+
+2. **Endpoints** (`src/gateway/a2a.rs`):
+   - `GET /.well-known/agent.json` - Agent discovery
+   - `POST /tasks` - Create task
+   - `GET /tasks/{id}` - Get task status
+   - `GET /tasks/{id}/stream` - SSE streaming
+   - `POST /tasks/{id}/cancel` - Cancel task
+
+3. **Channel Implementation** (`src/channels/a2a/channel.rs`):
+   - `send()` now POSTs to `/tasks` endpoint
+   - Added `peer_tasks_url()` helper
+
+4. **Config** (`src/config/schema.rs`):
+   - Added `AgentCardConfig` and `SkillConfig`
+
+### Build Status
+- ✅ Compiles successfully
+- ⚠️ Legacy `A2AMessage` code remains (marked deprecated) - can be removed in follow-up PR
 
 ## Overview
 
