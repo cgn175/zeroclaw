@@ -382,12 +382,53 @@ impl Channel for A2AChannel {
     /// Uses exponential backoff (2s, 4s, 8s, 16s, 32s, capped at 60s)
     /// with a maximum of 10 retries per peer connection. Failed peers
     /// are periodically recovered via health check background task.
-    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        // TODO: Implement Google A2A task stream listening
-        // This should connect to /tasks/{id}/stream endpoints for active tasks
-        tracing::warn!("A2A listen not yet implemented for Google A2A protocol");
+    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        // Google A2A uses task-based streaming, not continuous SSE
+        // For now, we implement a simple health check loop
+        // TODO: Implement proper task tracking and streaming when tasks are created
+        
+        let peers: Vec<A2APeer> = self
+            .peers
+            .values()
+            .filter(|p| p.enabled && self.config.is_peer_allowed(&p.id))
+            .cloned()
+            .collect();
+
+        if peers.is_empty() {
+            tracing::warn!("A2A: No enabled peers to listen to");
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        }
+
+        tracing::info!("A2A: Monitoring {} peer(s) for health", peers.len());
+
+        // Periodic health check loop
         loop {
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            for peer in &peers {
+                // Check peer health
+                let url = format!("{}/.well-known/agent.json", peer.endpoint.trim_end_matches('/'));
+                match self
+                    .http_client
+                    .get(&url)
+                    .timeout(Duration::from_secs(5))
+                    .send()
+                    .await
+                {
+                    Ok(response) if response.status().is_success() => {
+                        tracing::debug!("A2A: Peer {} is healthy", peer.id);
+                    }
+                    Ok(response) => {
+                        tracing::warn!("A2A: Peer {} returned status {}", peer.id, response.status());
+                    }
+                    Err(e) => {
+                        tracing::warn!("A2A: Failed to reach peer {}: {}", peer.id, e);
+                    }
+                }
+            }
+
+            // Sleep before next health check
+            tokio::time::sleep(Duration::from_secs(30)).await;
         }
     }
 
