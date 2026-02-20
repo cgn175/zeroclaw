@@ -13,7 +13,7 @@ use super::protocol::A2AMessage;
 use crate::channels::traits::ChannelMessage;
 use crate::gateway::AppState;
 use crate::memory::{Memory, MemoryCategory, MemoryEntry};
-// Provider trait imported when needed for provider operations
+use crate::providers::ChatMessage;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::sync::mpsc;

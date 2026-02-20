@@ -438,7 +438,10 @@ impl Channel for A2AChannel {
         let mut handles = Vec::new();
         let reconnect_config = self.reconnect_config.clone();
 
-        for (index, peer) in peers.iter().enumerate() {
+        // Clone peers to avoid lifetime issues with tokio::spawn
+        let peers_owned = peers.clone();
+
+        for (index, peer) in peers_owned.into_iter().enumerate() {
             let http_client = self.http_client.clone();
             let tx = tx.clone();
             let peer_id = peer.id.clone();
@@ -1155,7 +1158,7 @@ mod tests {
 
         let mut conn1 = PeerConnection::new(peer1);
         let mut conn2 = PeerConnection::new(peer2);
-        let mut conn3 = PeerConnection::new(peer3);
+        let conn3 = PeerConnection::new(peer3);
 
         // Simulate different states
         conn1.mark_connected(); // peer-1 is connected

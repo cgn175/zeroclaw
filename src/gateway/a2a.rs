@@ -799,7 +799,6 @@ mod tests {
     use super::*;
     use crate::config::schema::A2APeerConfig;
     use axum::http::HeaderValue;
-    use std::sync::Arc;
 
     fn create_test_config() -> A2AConfig {
         A2AConfig {
