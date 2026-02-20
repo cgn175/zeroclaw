@@ -308,7 +308,10 @@ impl Agent {
             .classification_config(config.query_classification.clone())
             .available_hints(available_hints)
             .identity_config(config.identity.clone())
-            .skills(crate::skills::load_skills(&config.workspace_dir))
+            .skills(crate::skills::load_skills_with_config(
+                &config.workspace_dir,
+                config,
+            ))
             .auto_save(config.memory.auto_save)
             .build()
     }
@@ -400,11 +403,8 @@ impl Agent {
             return results;
         }
 
-        let mut results = Vec::with_capacity(calls.len());
-        for call in calls {
-            results.push(self.execute_tool_call(call).await);
-        }
-        results
+        let futs: Vec<_> = calls.iter().map(|call| self.execute_tool_call(call)).collect();
+        futures::future::join_all(futs).await
     }
 
     fn classify_model(&self, user_message: &str) -> String {

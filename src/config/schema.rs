@@ -94,6 +94,10 @@ pub struct Config {
     #[serde(default)]
     pub agent: AgentConfig,
 
+    /// Skills loading and community repository behavior (`[skills]`).
+    #[serde(default)]
+    pub skills: SkillsConfig,
+
     /// Model routing rules — route `hint:<name>` to specific provider+model combos.
     #[serde(default)]
     pub model_routes: Vec<ModelRouteConfig>,
@@ -321,6 +325,28 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+        }
+    }
+}
+
+/// Skills loading configuration (`[skills]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkillsConfig {
+    /// Enable loading and syncing the community open-skills repository.
+    /// Default: `false` (opt-in).
+    #[serde(default)]
+    pub open_skills_enabled: bool,
+    /// Optional path to a local open-skills repository.
+    /// If unset, defaults to `$HOME/open-skills` when enabled.
+    #[serde(default)]
+    pub open_skills_dir: Option<String>,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            open_skills_enabled: false,
+            open_skills_dir: None,
         }
     }
 }
@@ -883,7 +909,7 @@ fn default_http_timeout_secs() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub enabled: bool,
     /// Search provider: "duckduckgo" (free, no API key) or "brave" (requires API key)
     #[serde(default = "default_web_search_provider")]
@@ -914,7 +940,7 @@ fn default_web_search_timeout_secs() -> u64 {
 impl Default for WebSearchConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             provider: default_web_search_provider(),
             brave_api_key: None,
             max_results: default_web_search_max_results(),
@@ -2199,7 +2225,10 @@ pub struct ChannelsConfig {
     pub qq: Option<QQConfig>,
     /// A2A (Agent-to-Agent) channel configuration.
     pub a2a: Option<A2AConfig>,
-    /// Timeout in seconds for processing a single channel message (LLM + tools).
+    /// Base timeout in seconds for processing a single channel message (LLM + tools).
+    /// Runtime uses this as a per-turn budget that scales with tool-loop depth
+    /// (up to 4x, capped) so one slow/retried model call does not consume the
+    /// entire conversation budget.
     /// Default: 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
     #[serde(default = "default_channel_message_timeout_secs")]
     pub message_timeout_secs: u64,
@@ -2460,6 +2489,13 @@ impl WhatsAppConfig {
     /// Check if this is a valid Web config
     pub fn is_web_config(&self) -> bool {
         self.session_path.is_some()
+    }
+
+    /// Returns true when both Cloud and Web selectors are present.
+    ///
+    /// Runtime currently prefers Cloud mode in this case for backward compatibility.
+    pub fn is_ambiguous_config(&self) -> bool {
+        self.phone_number_id.is_some() && self.session_path.is_some()
     }
 }
 
@@ -2909,6 +2945,7 @@ impl Default for Config {
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             agent: AgentConfig::default(),
+            skills: SkillsConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
@@ -3402,6 +3439,27 @@ impl Config {
             }
         }
 
+        // Open-skills opt-in flag: ZEROCLAW_OPEN_SKILLS_ENABLED
+        if let Ok(flag) = std::env::var("ZEROCLAW_OPEN_SKILLS_ENABLED") {
+            if !flag.trim().is_empty() {
+                match flag.trim().to_ascii_lowercase().as_str() {
+                    "1" | "true" | "yes" | "on" => self.skills.open_skills_enabled = true,
+                    "0" | "false" | "no" | "off" => self.skills.open_skills_enabled = false,
+                    _ => tracing::warn!(
+                        "Ignoring invalid ZEROCLAW_OPEN_SKILLS_ENABLED (valid: 1|0|true|false|yes|no|on|off)"
+                    ),
+                }
+            }
+        }
+
+        // Open-skills directory override: ZEROCLAW_OPEN_SKILLS_DIR
+        if let Ok(path) = std::env::var("ZEROCLAW_OPEN_SKILLS_DIR") {
+            let trimmed = path.trim();
+            if !trimmed.is_empty() {
+                self.skills.open_skills_dir = Some(trimmed.to_string());
+            }
+        }
+
         // Gateway port: ZEROCLAW_GATEWAY_PORT or PORT
         if let Ok(port_str) =
             std::env::var("ZEROCLAW_GATEWAY_PORT").or_else(|_| std::env::var("PORT"))
@@ -3702,20 +3760,23 @@ impl Config {
     }
 }
 
-#[cfg(unix)]
 async fn sync_directory(path: &Path) -> Result<()> {
-    let dir = File::open(path)
-        .await
-        .with_context(|| format!("Failed to open directory for fsync: {}", path.display()))?;
-    dir.sync_all()
-        .await
-        .with_context(|| format!("Failed to fsync directory metadata: {}", path.display()))?;
-    Ok(())
-}
+    #[cfg(unix)]
+    {
+        let dir = File::open(path)
+            .await
+            .with_context(|| format!("Failed to open directory for fsync: {}", path.display()))?;
+        dir.sync_all()
+            .await
+            .with_context(|| format!("Failed to fsync directory metadata: {}", path.display()))?;
+        return Ok(());
+    }
 
-#[cfg(not(unix))]
-async fn sync_directory(_path: &Path) -> Result<()> {
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -3738,6 +3799,7 @@ mod tests {
         assert!(c.default_model.as_deref().unwrap().contains("claude"));
         assert!((c.default_temperature - 0.7).abs() < f64::EPSILON);
         assert!(c.api_key.is_none());
+        assert!(!c.skills.open_skills_enabled);
         assert!(c.workspace_dir.to_string_lossy().contains("workspace"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
     }
@@ -3760,6 +3822,7 @@ mod tests {
             .expect("schema should expose top-level properties");
 
         assert!(properties.contains_key("default_provider"));
+        assert!(properties.contains_key("skills"));
         assert!(properties.contains_key("gateway"));
         assert!(properties.contains_key("channels_config"));
         assert!(!properties.contains_key("workspace_dir"));
@@ -3909,6 +3972,7 @@ default_temperature = 0.7
             },
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
+            skills: SkillsConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
@@ -4074,6 +4138,19 @@ tool_dispatcher = "xml"
     }
 
     #[tokio::test]
+    async fn sync_directory_handles_existing_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_sync_directory_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).await.unwrap();
+
+        sync_directory(&dir).await.unwrap();
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
     async fn config_save_and_load_tmpdir() {
         let dir = std::env::temp_dir().join("zeroclaw_test_config");
         let _ = fs::remove_dir_all(&dir).await;
@@ -4093,6 +4170,7 @@ tool_dispatcher = "xml"
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
+            skills: SkillsConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
@@ -4619,6 +4697,38 @@ channel_id = "C123"
     }
 
     #[test]
+    async fn whatsapp_config_backend_type_cloud_precedence_when_ambiguous() {
+        let wc = WhatsAppConfig {
+            access_token: Some("tok".into()),
+            phone_number_id: Some("123".into()),
+            verify_token: Some("ver".into()),
+            app_secret: None,
+            session_path: Some("~/.zeroclaw/state/whatsapp-web/session.db".into()),
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec!["+1".into()],
+        };
+        assert!(wc.is_ambiguous_config());
+        assert_eq!(wc.backend_type(), "cloud");
+    }
+
+    #[test]
+    async fn whatsapp_config_backend_type_web() {
+        let wc = WhatsAppConfig {
+            access_token: None,
+            phone_number_id: None,
+            verify_token: None,
+            app_secret: None,
+            session_path: Some("~/.zeroclaw/state/whatsapp-web/session.db".into()),
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec![],
+        };
+        assert!(!wc.is_ambiguous_config());
+        assert_eq!(wc.backend_type(), "web");
+    }
+
+    #[test]
     async fn channels_config_with_whatsapp() {
         let c = ChannelsConfig {
             cli: true,
@@ -5020,6 +5130,40 @@ default_temperature = 0.7
         assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
 
         std::env::remove_var("ZEROCLAW_PROVIDER");
+    }
+
+    #[test]
+    async fn env_override_open_skills_enabled_and_dir() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        assert!(!config.skills.open_skills_enabled);
+        assert!(config.skills.open_skills_dir.is_none());
+
+        std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "true");
+        std::env::set_var("ZEROCLAW_OPEN_SKILLS_DIR", "/tmp/open-skills");
+        config.apply_env_overrides();
+
+        assert!(config.skills.open_skills_enabled);
+        assert_eq!(
+            config.skills.open_skills_dir.as_deref(),
+            Some("/tmp/open-skills")
+        );
+
+        std::env::remove_var("ZEROCLAW_OPEN_SKILLS_ENABLED");
+        std::env::remove_var("ZEROCLAW_OPEN_SKILLS_DIR");
+    }
+
+    #[test]
+    async fn env_override_open_skills_enabled_invalid_value_keeps_existing_value() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.skills.open_skills_enabled = true;
+
+        std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "maybe");
+        config.apply_env_overrides();
+
+        assert!(config.skills.open_skills_enabled);
+        std::env::remove_var("ZEROCLAW_OPEN_SKILLS_ENABLED");
     }
 
     #[test]

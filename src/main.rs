@@ -105,6 +105,8 @@ enum ServiceCommands {
     Start,
     /// Stop daemon service
     Stop,
+    /// Restart daemon service to apply latest config
+    Restart,
     /// Check daemon service status
     Status,
     /// Uninstall daemon service unit
@@ -680,9 +682,9 @@ Examples:
 enum SkillCommands {
     /// List installed skills
     List,
-    /// Install a skill from a GitHub URL or local path
+    /// Install a skill from a git URL (HTTPS/SSH) or local path
     Install {
-        /// GitHub URL or local path
+        /// Git URL (HTTPS/SSH) or local path
         source: String,
     },
     /// Remove an installed skill
@@ -1056,9 +1058,7 @@ enabled = true"#,
             integration_command,
         } => integrations::handle_command(integration_command, &config),
 
-        Commands::Skills { skill_command } => {
-            skills::handle_command(skill_command, &config.workspace_dir)
-        }
+        Commands::Skills { skill_command } => skills::handle_command(skill_command, &config),
 
         Commands::Migrate { migrate_command } => {
             migration::handle_command(migrate_command, &config).await
@@ -1726,10 +1726,61 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn cli_definition_has_no_flag_conflicts() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn onboard_help_includes_model_flag() {
+        let cmd = Cli::command();
+        let onboard = cmd
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "onboard")
+            .expect("onboard subcommand must exist");
+
+        let has_model_flag = onboard
+            .get_arguments()
+            .any(|arg| arg.get_id().as_str() == "model" && arg.get_long() == Some("model"));
+
+        assert!(
+            has_model_flag,
+            "onboard help should include --model for quick setup overrides"
+        );
+    }
+
+    #[test]
+    fn onboard_cli_accepts_model_provider_and_api_key_in_quick_mode() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "onboard",
+            "--provider",
+            "openrouter",
+            "--model",
+            "custom-model-946",
+            "--api-key",
+            "sk-issue946",
+        ])
+        .expect("quick onboard invocation should parse");
+
+        match cli.command {
+            Commands::Onboard {
+                interactive,
+                channels_only,
+                api_key,
+                provider,
+                model,
+                ..
+            } => {
+                assert!(!interactive);
+                assert!(!channels_only);
+                assert_eq!(provider.as_deref(), Some("openrouter"));
+                assert_eq!(model.as_deref(), Some("custom-model-946"));
+                assert_eq!(api_key.as_deref(), Some("sk-issue946"));
+            }
+            other => panic!("expected onboard command, got {other:?}"),
+        }
     }
 }

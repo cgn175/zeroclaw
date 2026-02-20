@@ -26,6 +26,28 @@ Schema export command:
 | `default_model` | `anthropic/claude-sonnet-4-6` | model routed through selected provider |
 | `default_temperature` | `0.7` | model temperature |
 
+## `[observability]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `backend` | `none` | Observability backend: `none`, `noop`, `log`, `prometheus`, `otel`, `opentelemetry`, or `otlp` |
+| `otel_endpoint` | `http://localhost:4318` | OTLP HTTP endpoint used when backend is `otel` |
+| `otel_service_name` | `zeroclaw` | Service name emitted to OTLP collector |
+
+Notes:
+
+- `backend = "otel"` uses OTLP HTTP export with a blocking exporter client so spans and metrics can be emitted safely from non-Tokio contexts.
+- Alias values `opentelemetry` and `otlp` map to the same OTel backend.
+
+Example:
+
+```toml
+[observability]
+backend = "otel"
+otel_endpoint = "http://localhost:4318"
+otel_service_name = "zeroclaw"
+```
+
 ## Environment Provider Overrides
 
 Provider selection can also be controlled by environment variables. Precedence is:
@@ -92,6 +114,21 @@ Notes:
 - `reasoning_enabled = true` explicitly requests reasoning for supported providers (`think: true` on `ollama`).
 - Unset keeps provider defaults.
 
+## `[skills]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `open_skills_enabled` | `false` | Opt-in loading/sync of community `open-skills` repository |
+| `open_skills_dir` | unset | Optional local path for `open-skills` (defaults to `$HOME/open-skills` when enabled) |
+
+Notes:
+
+- Security-first default: ZeroClaw does **not** clone or sync `open-skills` unless `open_skills_enabled = true`.
+- Environment overrides:
+  - `ZEROCLAW_OPEN_SKILLS_ENABLED` accepts `1/0`, `true/false`, `yes/no`, `on/off`.
+  - `ZEROCLAW_OPEN_SKILLS_DIR` overrides the repository path when non-empty.
+- Precedence for enable flag: `ZEROCLAW_OPEN_SKILLS_ENABLED` → `skills.open_skills_enabled` in `config.toml` → default `false`.
+
 ## `[composio]`
 
 | Key | Default | Purpose |
@@ -104,6 +141,7 @@ Notes:
 
 - Backward compatibility: legacy `enable = true` is accepted as an alias for `enabled = true`.
 - If `enabled = false` or `api_key` is missing, the `composio` tool is not registered.
+- ZeroClaw requests Composio v3 tools with `toolkit_versions=latest` and executes tools with `version="latest"` to avoid stale default tool revisions.
 - Typical flow: call `connect`, complete browser OAuth, then run `execute` for the desired tool action.
 - If Composio returns a missing connected-account reference error, call `list_accounts` (optionally with `app`) and pass the returned `connected_account_id` to `execute`.
 
@@ -332,7 +370,7 @@ Top-level channel options are configured under `channels_config`.
 
 | Key | Default | Purpose |
 |---|---|---|
-| `message_timeout_secs` | `300` | Timeout in seconds for processing a single channel message (LLM + tools) |
+| `message_timeout_secs` | `300` | Base timeout in seconds for channel message processing; runtime scales this with tool-loop depth (up to 4x) |
 
 Examples:
 
@@ -344,13 +382,44 @@ Examples:
 Notes:
 
 - Default `300s` is optimized for on-device LLMs (Ollama) which are slower than cloud APIs.
+- Runtime timeout budget is `message_timeout_secs * scale`, where `scale = min(max_tool_iterations, 4)` and a minimum of `1`.
+- This scaling avoids false timeouts when the first LLM turn is slow/retried but later tool-loop turns still need to complete.
 - If using cloud APIs (OpenAI, Anthropic, etc.), you can reduce this to `60` or lower.
 - Values below `30` are clamped to `30` to avoid immediate timeout churn.
 - When a timeout occurs, users receive: `⚠️ Request timed out while waiting for the model. Please try again.`
 - Telegram-only interruption behavior is controlled with `channels_config.telegram.interrupt_on_new_message` (default `false`).
   When enabled, a newer message from the same sender in the same chat cancels the in-flight request and preserves interrupted user context.
+- While `zeroclaw channel start` is running, updates to `default_provider`, `default_model`, `default_temperature`, `api_key`, `api_url`, and `reliability.*` are hot-applied from `config.toml` on the next inbound message.
 
 See detailed channel matrix and allowlist behavior in [channels-reference.md](channels-reference.md).
+
+### `[channels_config.whatsapp]`
+
+WhatsApp supports two backends under one config table.
+
+Cloud API mode (Meta webhook):
+
+| Key | Required | Purpose |
+|---|---|---|
+| `access_token` | Yes | Meta Cloud API bearer token |
+| `phone_number_id` | Yes | Meta phone number ID |
+| `verify_token` | Yes | Webhook verification token |
+| `app_secret` | Optional | Enables webhook signature verification (`X-Hub-Signature-256`) |
+| `allowed_numbers` | Recommended | Allowed inbound numbers (`[]` = deny all, `"*"` = allow all) |
+
+WhatsApp Web mode (native client):
+
+| Key | Required | Purpose |
+|---|---|---|
+| `session_path` | Yes | Persistent SQLite session path |
+| `pair_phone` | Optional | Pair-code flow phone number (digits only) |
+| `pair_code` | Optional | Custom pair code (otherwise auto-generated) |
+| `allowed_numbers` | Recommended | Allowed inbound numbers (`[]` = deny all, `"*"` = allow all) |
+
+Notes:
+
+- WhatsApp Web requires build flag `whatsapp-web`.
+- If both Cloud and Web fields are present, Cloud mode wins for backward compatibility.
 
 ## `[hardware]`
 
@@ -425,6 +494,7 @@ After editing config:
 zeroclaw status
 zeroclaw doctor
 zeroclaw channel doctor
+zeroclaw service restart
 ```
 
 ## Related Docs

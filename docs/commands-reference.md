@@ -34,6 +34,7 @@ Last verified: **February 19, 2026**.
 - `zeroclaw onboard --interactive`
 - `zeroclaw onboard --channels-only`
 - `zeroclaw onboard --api-key <KEY> --provider <ID> --memory <sqlite|lucid|markdown|none>`
+- `zeroclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none>`
 
 ### `agent`
 
@@ -52,6 +53,7 @@ Last verified: **February 19, 2026**.
 - `zeroclaw service install`
 - `zeroclaw service start`
 - `zeroclaw service stop`
+- `zeroclaw service restart`
 - `zeroclaw service status`
 - `zeroclaw service uninstall`
 
@@ -90,6 +92,13 @@ Runtime in-chat commands (Telegram/Discord while channel server is running):
 - `/model`
 - `/model <model-id>`
 
+Channel runtime also watches `config.toml` and hot-applies updates to:
+- `default_provider`
+- `default_model`
+- `default_temperature`
+- `api_key` / `api_url` (for the default provider)
+- `reliability.*` provider retry settings
+
 `add/remove` currently route you back to managed setup/manual config paths (not full declarative mutators yet).
 
 ### `integrations`
@@ -101,6 +110,8 @@ Runtime in-chat commands (Telegram/Discord while channel server is running):
 - `zeroclaw skills list`
 - `zeroclaw skills install <source>`
 - `zeroclaw skills remove <name>`
+
+`<source>` accepts git remotes (`https://...`, `http://...`, `ssh://...`, and `git@host:owner/repo.git`) or a local filesystem path.
 
 Skill manifests (`SKILL.toml`) support `prompts` and `[[tools]]`; both are injected into the agent system prompt at runtime, so the model can follow skill instructions without manually reading skill files.
 

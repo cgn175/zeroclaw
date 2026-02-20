@@ -39,47 +39,49 @@ use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 
 pub mod agent;
-pub mod approval;
-pub mod auth;
+pub(crate) mod approval;
+pub(crate) mod auth;
 pub mod channels;
 pub mod config;
-pub mod cost;
-pub mod cron;
-pub mod daemon;
-pub mod doctor;
+pub(crate) mod cost;
+pub(crate) mod cron;
+pub(crate) mod daemon;
+pub(crate) mod doctor;
 pub mod gateway;
-pub mod hardware;
-pub mod health;
-pub mod heartbeat;
-pub mod identity;
-pub mod integrations;
+pub(crate) mod hardware;
+pub(crate) mod health;
+pub(crate) mod heartbeat;
+pub(crate) mod identity;
+pub(crate) mod integrations;
 pub mod memory;
-pub mod migration;
-pub mod multimodal;
+pub(crate) mod migration;
+pub(crate) mod multimodal;
 pub mod observability;
-pub mod onboard;
+pub(crate) mod onboard;
 pub mod peripherals;
 pub mod providers;
 pub mod rag;
 pub mod runtime;
-pub mod security;
-pub mod service;
-pub mod skills;
+pub(crate) mod security;
+pub(crate) mod service;
+pub(crate) mod skills;
 pub mod tools;
-pub mod tunnel;
-pub mod util;
+pub(crate) mod tunnel;
+pub(crate) mod util;
 
 pub use config::Config;
 
 /// Service management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ServiceCommands {
+pub(crate) enum ServiceCommands {
     /// Install daemon service unit for auto-start and restart
     Install,
     /// Start daemon service
     Start,
     /// Stop daemon service
     Stop,
+    /// Restart daemon service to apply latest config
+    Restart,
     /// Check daemon service status
     Status,
     /// Uninstall daemon service unit
@@ -88,7 +90,7 @@ pub enum ServiceCommands {
 
 /// Channel management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ChannelCommands {
+pub(crate) enum ChannelCommands {
     /// List all configured channels
     List,
     /// Start all configured channels (handled in main.rs for async)
@@ -220,12 +222,12 @@ Examples:
 
 /// Skills management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum SkillCommands {
+pub(crate) enum SkillCommands {
     /// List all installed skills
     List,
-    /// Install a new skill from a URL or local path
+    /// Install a new skill from a git URL (HTTPS/SSH) or local path
     Install {
-        /// Source URL or local path
+        /// Source git URL (HTTPS/SSH) or local path
         source: String,
     },
     /// Remove an installed skill
@@ -237,7 +239,7 @@ pub enum SkillCommands {
 
 /// Migration subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum MigrateCommands {
+pub(crate) enum MigrateCommands {
     /// Import memory from an `OpenClaw` workspace into this `ZeroClaw` workspace
     Openclaw {
         /// Optional path to `OpenClaw` workspace (defaults to ~/.openclaw/workspace)
@@ -252,7 +254,7 @@ pub enum MigrateCommands {
 
 /// Cron subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum CronCommands {
+pub(crate) enum CronCommands {
     /// List all scheduled tasks
     List,
     /// Add a new scheduled task
@@ -367,7 +369,7 @@ Examples:
 
 /// Integration subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum IntegrationCommands {
+pub(crate) enum IntegrationCommands {
     /// Show details about a specific integration
     Info {
         /// Integration name

@@ -26,6 +26,10 @@ const STREAM_CHUNK_MIN_CHARS: usize = 80;
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
+/// Minimum user-message length (in chars) for auto-save to memory.
+/// Matches the channel-side constant in `channels/mod.rs`.
+const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
+
 static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
         r"(?i)token",
@@ -1095,11 +1099,13 @@ pub(crate) async fn run_tool_call_loop(
                         arguments: call.arguments.clone(),
                     };
 
-                    // Only prompt interactively on CLI; auto-approve on other channels.
+                    // On CLI, prompt interactively. On other channels where
+                    // interactive approval is not possible, deny the call to
+                    // respect the supervised autonomy setting.
                     let decision = if channel_name == "cli" {
                         mgr.prompt_cli(&request)
                     } else {
-                        ApprovalResponse::Yes
+                        ApprovalResponse::No
                     };
 
                     mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
@@ -1344,7 +1350,7 @@ pub async fn run(
         .collect();
 
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
-    let skills = crate::skills::load_skills(&config.workspace_dir);
+    let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
     let mut tool_descs: Vec<(&str, &str)> = vec![
         (
             "shell",
@@ -1454,17 +1460,21 @@ pub async fn run(
     } else {
         None
     };
-    let mut system_prompt = crate::channels::build_system_prompt(
+    let native_tools = provider.supports_native_tools();
+    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
         model_name,
         &tool_descs,
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
+        native_tools,
     );
 
-    // Append structured tool-use instructions with schemas
-    system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    // Append structured tool-use instructions with schemas (only for non-native providers)
+    if !native_tools {
+        system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    }
 
     // ── Approval manager (supervised mode) ───────────────────────
     let approval_manager = ApprovalManager::from_config(&config.autonomy);
@@ -1475,8 +1485,8 @@ pub async fn run(
     let mut final_output = String::new();
 
     if let Some(msg) = message {
-        // Auto-save user message to memory
-        if config.memory.auto_save {
+        // Auto-save user message to memory (skip short/trivial messages)
+        if config.memory.auto_save && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
             let user_key = autosave_memory_key("user_msg");
             let _ = mem
                 .store(&user_key, &msg, MemoryCategory::Conversation, None)
@@ -1597,8 +1607,10 @@ pub async fn run(
                 _ => {}
             }
 
-            // Auto-save conversation turns
-            if config.memory.auto_save {
+            // Auto-save conversation turns (skip short/trivial messages)
+            if config.memory.auto_save
+                && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+            {
                 let user_key = autosave_memory_key("user_msg");
                 let _ = mem
                     .store(&user_key, &user_input, MemoryCategory::Conversation, None)
@@ -1768,7 +1780,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         .map(|b| b.board.clone())
         .collect();
 
-    let skills = crate::skills::load_skills(&config.workspace_dir);
+    let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
     let mut tool_descs: Vec<(&str, &str)> = vec![
         ("shell", "Execute terminal commands."),
         ("file_read", "Read file contents."),
@@ -1817,15 +1829,19 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     } else {
         None
     };
-    let mut system_prompt = crate::channels::build_system_prompt(
+    let native_tools = provider.supports_native_tools();
+    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
         &model_name,
         &tool_descs,
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
+        native_tools,
     );
-    system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    if !native_tools {
+        system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    }
 
     let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };

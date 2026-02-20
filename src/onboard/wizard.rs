@@ -160,6 +160,7 @@ pub async fn run_wizard() -> Result<Config> {
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
         agent: crate::config::schema::AgentConfig::default(),
+        skills: crate::config::SkillsConfig::default(),
         model_routes: Vec::new(),
         embedding_routes: Vec::new(),
         heartbeat: HeartbeatConfig::default(),
@@ -332,6 +333,28 @@ pub async fn run_quick_setup(
     model_override: Option<&str>,
     memory_backend: Option<&str>,
 ) -> Result<Config> {
+    let home = directories::UserDirs::new()
+        .map(|u| u.home_dir().to_path_buf())
+        .context("Could not find home directory")?;
+
+    run_quick_setup_with_home(
+        credential_override,
+        provider,
+        model_override,
+        memory_backend,
+        &home,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_quick_setup_with_home(
+    credential_override: Option<&str>,
+    provider: Option<&str>,
+    model_override: Option<&str>,
+    memory_backend: Option<&str>,
+    home: &Path,
+) -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
     println!(
         "  {}",
@@ -341,9 +364,6 @@ pub async fn run_quick_setup(
     );
     println!();
 
-    let home = directories::UserDirs::new()
-        .map(|u| u.home_dir().to_path_buf())
-        .context("Could not find home directory")?;
     let zeroclaw_dir = home.join(".zeroclaw");
     let workspace_dir = zeroclaw_dir.join("workspace");
     let config_path = zeroclaw_dir.join("config.toml");
@@ -379,6 +399,7 @@ pub async fn run_quick_setup(
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
         agent: crate::config::schema::AgentConfig::default(),
+        skills: crate::config::SkillsConfig::default(),
         model_routes: Vec::new(),
         embedding_routes: Vec::new(),
         heartbeat: HeartbeatConfig::default(),
@@ -3219,10 +3240,92 @@ fn setup_channels() -> Result<ChannelsConfig> {
             ChannelMenuChoice::WhatsApp => {
                 // ── WhatsApp ──
                 println!();
+                println!("  {}", style("WhatsApp Setup").white().bold());
+
+                let mode_options = vec![
+                    "WhatsApp Web (QR / pair-code, no Meta Business API)",
+                    "WhatsApp Business Cloud API (webhook)",
+                ];
+                let mode_idx = Select::new()
+                    .with_prompt("  Choose WhatsApp mode")
+                    .items(&mode_options)
+                    .default(0)
+                    .interact()?;
+
+                if mode_idx == 0 {
+                    println!("  {}", style("Mode: WhatsApp Web").dim());
+                    print_bullet("1. Build with --features whatsapp-web");
+                    print_bullet(
+                        "2. Start channel/daemon and scan QR in WhatsApp > Linked Devices",
+                    );
+                    print_bullet("3. Keep session_path persistent so relogin is not required");
+                    println!();
+
+                    let session_path: String = Input::new()
+                        .with_prompt("  Session database path")
+                        .default("~/.zeroclaw/state/whatsapp-web/session.db".into())
+                        .interact_text()?;
+
+                    if session_path.trim().is_empty() {
+                        println!("  {} Skipped — session path required", style("→").dim());
+                        continue;
+                    }
+
+                    let pair_phone: String = Input::new()
+                        .with_prompt(
+                            "  Pair phone (optional, digits only; leave empty to use QR flow)",
+                        )
+                        .allow_empty(true)
+                        .interact_text()?;
+
+                    let pair_code: String = if pair_phone.trim().is_empty() {
+                        String::new()
+                    } else {
+                        Input::new()
+                            .with_prompt(
+                                "  Custom pair code (optional, leave empty for auto-generated)",
+                            )
+                            .allow_empty(true)
+                            .interact_text()?
+                    };
+
+                    let users_str: String = Input::new()
+                        .with_prompt(
+                            "  Allowed phone numbers (comma-separated +1234567890, or * for all)",
+                        )
+                        .default("*".into())
+                        .interact_text()?;
+
+                    let allowed_numbers = if users_str.trim() == "*" {
+                        vec!["*".into()]
+                    } else {
+                        users_str.split(',').map(|s| s.trim().to_string()).collect()
+                    };
+
+                    config.whatsapp = Some(WhatsAppConfig {
+                        access_token: None,
+                        phone_number_id: None,
+                        verify_token: None,
+                        app_secret: None,
+                        session_path: Some(session_path.trim().to_string()),
+                        pair_phone: (!pair_phone.trim().is_empty())
+                            .then(|| pair_phone.trim().to_string()),
+                        pair_code: (!pair_code.trim().is_empty())
+                            .then(|| pair_code.trim().to_string()),
+                        allowed_numbers,
+                    });
+
+                    println!(
+                        "  {} WhatsApp Web configuration saved.",
+                        style("✅").green().bold()
+                    );
+                    continue;
+                }
+
                 println!(
                     "  {} {}",
-                    style("WhatsApp Setup").white().bold(),
-                    style("— Business Cloud API").dim()
+                    style("Mode:").dim(),
+                    style("Business Cloud API").dim()
                 );
                 print_bullet("1. Go to developers.facebook.com and create a WhatsApp app");
                 print_bullet("2. Add the WhatsApp product and get your phone number ID");
@@ -4671,6 +4774,48 @@ mod tests {
         assert!(ctx.timezone.is_empty());
         assert!(ctx.agent_name.is_empty());
         assert!(ctx.communication_style.is_empty());
+    }
+
+    #[tokio::test]
+    async fn quick_setup_model_override_persists_to_config_toml() {
+        let tmp = TempDir::new().unwrap();
+
+        let config = run_quick_setup_with_home(
+            Some("sk-issue946"),
+            Some("openrouter"),
+            Some("custom-model-946"),
+            Some("sqlite"),
+            tmp.path(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(config.default_provider.as_deref(), Some("openrouter"));
+        assert_eq!(config.default_model.as_deref(), Some("custom-model-946"));
+        assert_eq!(config.api_key.as_deref(), Some("sk-issue946"));
+
+        let config_raw = tokio::fs::read_to_string(config.config_path).await.unwrap();
+        assert!(config_raw.contains("default_provider = \"openrouter\""));
+        assert!(config_raw.contains("default_model = \"custom-model-946\""));
+    }
+
+    #[tokio::test]
+    async fn quick_setup_without_model_uses_provider_default_model() {
+        let tmp = TempDir::new().unwrap();
+
+        let config = run_quick_setup_with_home(
+            Some("sk-issue946"),
+            Some("anthropic"),
+            None,
+            Some("sqlite"),
+            tmp.path(),
+        )
+        .await
+        .unwrap();
+
+        let expected = default_model_for_provider("anthropic");
+        assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
+        assert_eq!(config.default_model.as_deref(), Some(expected.as_str()));
     }
 
     // ── scaffold_workspace: basic file creation ─────────────────
