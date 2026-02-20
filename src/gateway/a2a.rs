@@ -794,6 +794,259 @@ fn generate_bearer_token() -> String {
     format!("a2a_{}", hex::encode(bytes))
 }
 
+// =============================================================================
+// Google A2A Protocol Endpoints
+// =============================================================================
+
+use crate::channels::a2a::protocol::{
+    AgentCapabilities, AgentCard, AgentEndpoints, AuthenticationInfo, CancelTaskRequest,
+    CancelTaskResponse, CreateTaskRequest, CreateTaskResponse, GetTaskRequest, Task, TaskMessage,
+    TaskStatus, TaskUpdate,
+};
+
+/// GET /.well-known/agent.json - Agent discovery endpoint.
+///
+/// Returns the Agent Card describing this agent's capabilities.
+pub async fn handle_agent_card(State(state): State<AppState>) -> impl IntoResponse {
+    // Try to get agent card from config, otherwise use defaults
+    let config = state.config.lock();
+    let a2a_config = config.channels_config.a2a.clone();
+
+    let card = if let Some(a2a) = a2a_config {
+        if let Some(agent_card_config) = a2a.agent_card {
+            AgentCard {
+                name: agent_card_config.name,
+                description: agent_card_config.description,
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                capabilities: AgentCapabilities::default(),
+                authentication: AuthenticationInfo::default(),
+                endpoints: AgentEndpoints::default(),
+                skills: agent_card_config
+                    .skills
+                    .into_iter()
+                    .map(|s| crate::channels::a2a::protocol::Skill {
+                        id: s.id,
+                        name: s.name,
+                        description: s.description,
+                        input_schema: None,
+                        output_schema: None,
+                    })
+                    .collect(),
+            }
+        } else {
+            // Default agent card
+            AgentCard {
+                name: "ZeroClaw Agent".to_string(),
+                description: "ZeroClaw autonomous agent".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                capabilities: AgentCapabilities::default(),
+                authentication: AuthenticationInfo::default(),
+                endpoints: AgentEndpoints::default(),
+                skills: vec![],
+            }
+        }
+    } else {
+        // Default agent card when A2A not configured
+        AgentCard {
+            name: "ZeroClaw Agent".to_string(),
+            description: "ZeroClaw autonomous agent".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            capabilities: AgentCapabilities::default(),
+            authentication: AuthenticationInfo::default(),
+            endpoints: AgentEndpoints::default(),
+            skills: vec![],
+        }
+    };
+
+    tracing::debug!("Agent card requested: {}", card.name);
+    Json(card)
+}
+
+/// POST /tasks - Create a new task.
+///
+/// Creates a new task and returns it with pending status.
+pub async fn handle_create_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<CreateTaskRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    // Check if A2A is enabled
+    let a2a_config = match &state.config.lock().channels_config.a2a {
+        Some(config) if config.enabled => config.clone(),
+        _ => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "A2A channel not enabled"
+                })),
+            );
+        }
+    };
+
+    // Verify bearer token
+    let peer_id = match verify_bearer_token(&headers, &a2a_config) {
+        Ok(id) => id,
+        Err(status) => {
+            return (status, Json(serde_json::json!({"error": "Unauthorized"})));
+        }
+    };
+
+    // Parse request body
+    let Json(request) = match body {
+        Ok(req) => req,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Invalid JSON body",
+                    "details": e.to_string()
+                })),
+            );
+        }
+    };
+
+    // Create new task
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let mut task = Task::new(&task_id);
+    task.add_message(request.message);
+
+    tracing::info!("A2A task created: {} by peer {}", task_id, peer_id);
+
+    // TODO: Store task in task store and process asynchronously
+    // For now, return the task directly
+    let response = CreateTaskResponse { task };
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::to_value(response).unwrap()),
+    )
+}
+
+/// GET /tasks/{id} - Get task status and result.
+pub async fn handle_get_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+) -> impl IntoResponse {
+    // Check if A2A is enabled
+    let a2a_config = match &state.config.lock().channels_config.a2a {
+        Some(config) if config.enabled => config.clone(),
+        _ => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "A2A channel not enabled"
+                })),
+            );
+        }
+    };
+
+    // Verify bearer token
+    let _peer_id = match verify_bearer_token(&headers, &a2a_config) {
+        Ok(id) => id,
+        Err(status) => {
+            return (status, Json(serde_json::json!({"error": "Unauthorized"})));
+        }
+    };
+
+    // TODO: Look up task from task store
+    // For now, return not found
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": "Task not found",
+            "task_id": task_id
+        })),
+    )
+}
+
+/// POST /tasks/{id}/cancel - Cancel a task.
+pub async fn handle_cancel_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+    body: Result<Json<CancelTaskRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    // Check if A2A is enabled
+    let a2a_config = match &state.config.lock().channels_config.a2a {
+        Some(config) if config.enabled => config.clone(),
+        _ => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "A2A channel not enabled"
+                })),
+            );
+        }
+    };
+
+    // Verify bearer token
+    let _peer_id = match verify_bearer_token(&headers, &a2a_config) {
+        Ok(id) => id,
+        Err(status) => {
+            return (status, Json(serde_json::json!({"error": "Unauthorized"})));
+        }
+    };
+
+    // TODO: Cancel task in task store
+    // For now, return not found
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": "Task not found",
+            "task_id": task_id
+        })),
+    )
+}
+
+/// GET /tasks/{id}/stream - SSE stream for task updates.
+pub async fn handle_task_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+) -> impl IntoResponse {
+    // Check if A2A is enabled
+    let a2a_config = match &state.config.lock().channels_config.a2a {
+        Some(config) if config.enabled => config.clone(),
+        _ => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "A2A channel not enabled"
+                })),
+            );
+        }
+    };
+
+    // Verify bearer token
+    let _peer_id = match verify_bearer_token(&headers, &a2a_config) {
+        Ok(id) => id,
+        Err(status) => {
+            return (status, Json(serde_json::json!({"error": "Unauthorized"})));
+        }
+    };
+
+    if task_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Task ID cannot be empty"})),
+        );
+    }
+
+    tracing::debug!("A2A task stream requested for task: {}", task_id);
+
+    // TODO: Implement actual SSE streaming for task updates
+    // For now, return a placeholder response
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "task_id": task_id,
+            "status": "pending",
+            "message": "Streaming not yet implemented"
+        })),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -829,6 +1082,7 @@ mod tests {
             rate_limit: crate::config::schema::A2ARateLimitConfig::default(),
             idempotency: crate::config::schema::A2AIdempotencyConfig::default(),
             reconnect: crate::config::schema::A2AReconnectConfig::default(),
+            agent_card: None,
         }
     }
 

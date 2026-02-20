@@ -2604,6 +2604,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                     peers: protocol_peers,
                     rate_limit: crate::channels::a2a::protocol::A2ARateLimitConfig::default(),
                     idempotency: crate::channels::a2a::protocol::A2AIdempotencyConfig::default(),
+                    agent_card: None,
                 };
 
                 channels.push(Arc::new(A2AChannel::new(a2a_protocol_config)));

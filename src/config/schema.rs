@@ -2832,6 +2832,9 @@ pub struct A2AConfig {
     /// Idempotency configuration.
     #[serde(default)]
     pub idempotency: A2AIdempotencyConfig,
+    /// Agent card configuration for Google A2A protocol.
+    #[serde(default)]
+    pub agent_card: Option<AgentCardConfig>,
 }
 
 /// A2A reconnection configuration.
@@ -2868,6 +2871,29 @@ fn default_a2a_reconnect_initial_delay() -> u64 {
 
 fn default_a2a_reconnect_max_delay() -> u64 {
     60
+}
+
+/// Agent card configuration for Google A2A protocol.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AgentCardConfig {
+    /// Agent name.
+    pub name: String,
+    /// Agent description.
+    pub description: String,
+    /// Skills available.
+    #[serde(default)]
+    pub skills: Vec<SkillConfig>,
+}
+
+/// Skill configuration for agent card.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkillConfig {
+    /// Skill ID.
+    pub id: String,
+    /// Skill name.
+    pub name: String,
+    /// Skill description.
+    pub description: String,
 }
 
 fn default_a2a_reconnect_max_retries() -> u32 {
@@ -2919,6 +2945,7 @@ impl Default for A2AConfig {
             reconnect: A2AReconnectConfig::default(),
             rate_limit: A2ARateLimitConfig::default(),
             idempotency: A2AIdempotencyConfig::default(),
+            agent_card: None,
         }
     }
 }

@@ -575,11 +575,18 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/linq", post(handle_linq_webhook))
         // A2A (Agent-to-Agent) protocol endpoints
+        // Legacy endpoints
         .route("/a2a/send", post(a2a::handle_a2a_send))
         .route("/a2a/stream/{session_id}", get(a2a::handle_a2a_stream))
         .route("/a2a/health", get(a2a::handle_a2a_health))
         .route("/a2a/pair/request", post(a2a::handle_a2a_pair_request))
         .route("/a2a/pair/confirm", post(a2a::handle_a2a_pair_confirm))
+        // Google A2A protocol endpoints
+        .route("/.well-known/agent.json", get(a2a::handle_agent_card))
+        .route("/tasks", post(a2a::handle_create_task))
+        .route("/tasks/{id}", get(a2a::handle_get_task))
+        .route("/tasks/{id}/stream", get(a2a::handle_task_stream))
+        .route("/tasks/{id}/cancel", post(a2a::handle_cancel_task))
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(

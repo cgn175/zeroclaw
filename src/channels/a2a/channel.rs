@@ -3,11 +3,12 @@
 //! This module provides the channel implementation for agent-to-agent communication,
 //! enabling secure, authenticated messaging between peer agents over HTTP.
 //!
-//! # Architecture
+//! # Architecture (Google A2A Protocol)
 //!
-//! The A2A channel uses a client-server model where:
-//! - **Send**: POST messages to peer's `/a2a/send` endpoint
-//! - **Listen**: Connect to SSE streams from enabled peers for incoming messages
+//! The A2A channel uses a task-based model:
+//! - **Send**: POST to peer's `/tasks` endpoint (creates a Task)
+//! - **Listen**: Connect to SSE streams from peers at `/tasks/:id/stream`
+//! - **Task**: Contains messages[], artifacts[], and status (pending/running/completed/failed)
 //! - **Health Check**: Ping all peers and return true if any respond
 //!
 //! # Reconnection Strategy
@@ -17,7 +18,7 @@
 //! - Maximum retries: 10
 //! - HTTP client timeout: 30s
 
-use super::protocol::{A2AConfig, A2AMessage, A2APeer};
+use super::protocol::{A2AConfig, A2AMessage, A2APeer, CreateTaskRequest};
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -239,13 +240,26 @@ impl A2AChannel {
         }
     }
 
-    /// Build the full URL for a peer's send endpoint.
-    fn peer_send_url(peer: &A2APeer) -> String {
+    /// Build the full URL for a peer's tasks endpoint (Google A2A).
+    fn peer_tasks_url(peer: &A2APeer) -> String {
         let base = peer.endpoint.trim_end_matches('/');
-        format!("{}/a2a/send", base)
+        format!("{}/tasks", base)
     }
 
-    /// Build the full URL for a peer's SSE endpoint.
+    /// Build the full URL for a peer's task stream endpoint (Google A2A).
+    fn peer_task_stream_url(peer: &A2APeer, task_id: &str) -> String {
+        let base = peer.endpoint.trim_end_matches('/');
+        format!("{}/tasks/{}/stream", base, task_id)
+    }
+
+    /// Legacy: Build the full URL for a peer's send endpoint.
+    #[deprecated(note = "Use peer_tasks_url instead")]
+    fn peer_send_url(peer: &A2APeer) -> String {
+        Self::peer_tasks_url(peer)
+    }
+
+    /// Legacy: Build the full URL for a peer's SSE endpoint.
+    #[deprecated(note = "Use peer_task_stream_url instead")]
     fn peer_sse_url(peer: &A2APeer) -> String {
         let base = peer.endpoint.trim_end_matches('/');
         format!("{}/a2a/events", base)
@@ -320,9 +334,9 @@ impl Channel for A2AChannel {
     /// # Process
     ///
     /// 1. Resolve recipient to peer endpoint from config
-    /// 2. Build A2AMessage envelope
-    /// 3. POST to peer's `/a2a/send` endpoint
-    /// 4. Handle 202 Accepted response
+    /// 2. Build TaskMessage (Google A2A protocol)
+    /// 3. POST to peer's `/tasks` endpoint
+    /// 4. Handle response
     ///
     /// # Errors
     ///
@@ -336,49 +350,31 @@ impl Channel for A2AChannel {
             .resolve_peer(&message.recipient)
             .ok_or_else(|| anyhow::anyhow!("Unknown or disallowed peer: {}", message.recipient))?;
 
-        // Step 2: Build A2AMessage envelope
-        // Use subject as session_id if provided, otherwise generate from recipient
-        let session_id = message
-            .subject
-            .clone()
-            .unwrap_or_else(|| format!("session_{}", message.recipient));
+        // Step 2: Create task request with user message (Google A2A protocol)
+        let task_request = CreateTaskRequest::new(&message.content);
 
-        let a2a_message = A2AMessage::new(
-            &session_id,
-            "self", // Our identity as sender
-            &peer.id,
-            &message.content,
-        );
-
-        // Step 3: POST to peer's /a2a/send endpoint
-        let url = Self::peer_send_url(peer);
+        // Step 3: POST to peer's /tasks endpoint
+        let url = Self::peer_tasks_url(peer);
         let response = self
             .http_client
             .post(&url)
             .header("Authorization", format!("Bearer {}", peer.bearer_token))
             .header("Content-Type", "application/json")
-            .json(&a2a_message)
+            .json(&task_request)
             .send()
             .await?;
 
-        // Step 4: Handle 202 Accepted response
+        // Step 4: Handle response
         let status = response.status();
-        if status == reqwest::StatusCode::ACCEPTED {
-            tracing::debug!("A2A message accepted by peer: {}", peer.id);
-            Ok(())
-        } else if status.is_success() {
-            tracing::debug!(
-                "A2A message delivered to peer: {} (status: {})",
-                peer.id,
-                status
-            );
+        if status == reqwest::StatusCode::ACCEPTED || status.is_success() {
+            tracing::debug!("A2A task accepted by peer: {}", peer.id);
             Ok(())
         } else {
             let body = response
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-            anyhow::bail!("A2A send failed ({}): {}", status, body);
+            anyhow::bail!("A2A task send failed ({}): {}", status, body);
         }
     }
 

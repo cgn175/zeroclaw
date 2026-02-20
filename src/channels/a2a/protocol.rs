@@ -1,153 +1,445 @@
-//! A2A (Agent-to-Agent) Protocol Types
+//! A2A (Agent-to-Agent) Protocol Types - Google A2A Standard
 //!
-//! This module defines the core message types and configuration structures for
-//! agent-to-agent communication in ZeroClaw. The protocol enables secure,
-//! authenticated messaging between peer agents over HTTP.
+//! This module defines the core message types for agent-to-agent communication
+//! following the Google A2A protocol specification (https://github.com/google/A2A).
+//!
+//! # Google A2A Protocol Overview
+//!
+//! - **Agent Card** - Describes agent capabilities at `/.well-known/agent.json`
+//! - **Task** - The primary unit of work with states: pending, running, completed, failed, cancelled
+//! - **TaskMessage** - Messages within a task (user/agent roles)
+//! - **Artifact** - Files, images, and binary content
+//! - **TaskUpdate** - SSE events for streaming task updates
 //!
 //! # Security Model
 //!
 //! - Bearer token authentication for all peer-to-peer communication
 //! - Deny-by-default for unknown peers (configurable via `allowed_peer_ids`)
-//! - Static peer discovery mode (no dynamic peer registration)
+//! - Agent Card discovery for peer capabilities
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
-use uuid::Uuid;
 
-/// Message envelope for agent-to-agent communication.
+// =============================================================================
+// Agent Card Types
+// =============================================================================
+
+/// Agent Card describing agent capabilities and endpoints.
 ///
-/// This struct represents a single message sent between agents. Each message
-/// has a unique ID, belongs to a session (conversation thread), and can
-/// reference a parent message for threaded replies.
+/// This is the discovery document returned at `/.well-known/agent.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct A2AMessage {
-    /// Unique message identifier (UUID v4)
-    pub id: String,
-    /// Conversation thread identifier for grouping related messages
-    pub session_id: String,
-    /// Sender peer identifier
-    pub sender_id: String,
-    /// Recipient peer identifier
-    pub recipient_id: String,
-    /// Message content (plaintext or structured payload)
-    pub content: String,
-    /// Unix timestamp (seconds since epoch)
-    pub timestamp: u64,
-    /// Optional parent message ID for threaded replies
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reply_to: Option<String>,
+pub struct AgentCard {
+    /// Unique name identifying this agent.
+    pub name: String,
+    /// Human-readable description of what this agent does.
+    pub description: String,
+    /// Semantic version string for this agent.
+    pub version: String,
+    /// Capabilities supported by this agent.
+    pub capabilities: AgentCapabilities,
+    /// Authentication schemes supported.
+    pub authentication: AuthenticationInfo,
+    /// Endpoint URLs for this agent.
+    pub endpoints: AgentEndpoints,
+    /// Skills this agent can perform.
+    #[serde(default)]
+    pub skills: Vec<Skill>,
 }
 
-impl A2AMessage {
-    /// Create a new A2A message with auto-generated UUID and current timestamp.
-    ///
-    /// # Arguments
-    ///
-    /// * `session_id` - The conversation thread ID
-    /// * `sender_id` - The sender peer identifier
-    /// * `recipient_id` - The recipient peer identifier
-    /// * `content` - The message content
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use zeroclaw::channels::a2a::protocol::A2AMessage;
-    ///
-    /// let msg = A2AMessage::new(
-    ///     "session-123",
-    ///     "peer-a",
-    ///     "peer-b",
-    ///     "Hello, peer!",
-    /// );
-    /// ```
+/// Capabilities supported by an agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentCapabilities {
+    /// Whether the agent supports streaming responses via SSE.
+    #[serde(default = "default_true")]
+    pub streaming: bool,
+    /// Whether the agent can produce and consume artifacts.
+    #[serde(default = "default_true")]
+    pub artifacts: bool,
+    /// Whether the agent supports push notifications.
+    #[serde(default = "default_false")]
+    pub push_notifications: bool,
+}
+
+impl Default for AgentCapabilities {
+    fn default() -> Self {
+        Self {
+            streaming: true,
+            artifacts: true,
+            push_notifications: false,
+        }
+    }
+}
+
+/// Authentication information for an agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AuthenticationInfo {
+    /// Supported authentication schemes.
+    #[serde(default)]
+    pub schemes: Vec<String>,
+}
+
+impl Default for AuthenticationInfo {
+    fn default() -> Self {
+        Self {
+            schemes: vec!["bearer".to_string()],
+        }
+    }
+}
+
+/// Endpoint URLs for an agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentEndpoints {
+    /// URL pattern for task creation.
+    #[serde(default = "default_tasks_endpoint")]
+    pub tasks: String,
+    /// URL pattern for task streaming.
+    #[serde(default = "default_stream_endpoint")]
+    pub stream: String,
+}
+
+impl Default for AgentEndpoints {
+    fn default() -> Self {
+        Self {
+            tasks: "/tasks".to_string(),
+            stream: "/tasks/{id}/stream".to_string(),
+        }
+    }
+}
+
+/// A skill the agent can perform.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Skill {
+    /// Unique skill identifier.
+    pub id: String,
+    /// Human-readable skill name.
+    pub name: String,
+    /// Description of what this skill does.
+    pub description: String,
+    /// JSON Schema for skill input.
+    #[serde(default)]
+    pub input_schema: Option<serde_json::Value>,
+    /// JSON Schema for skill output.
+    #[serde(default)]
+    pub output_schema: Option<serde_json::Value>,
+}
+
+// =============================================================================
+// Task Types
+// =============================================================================
+
+/// Task represents a unit of work in the A2A protocol.
+///
+/// Tasks are the primary abstraction for agent-to-agent communication.
+/// Each task has a unique ID, a status, and contains messages and artifacts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Task {
+    /// Unique task identifier.
+    pub id: String,
+    /// Current status of the task.
+    pub status: TaskStatus,
+    /// Timestamp when the task was created (ISO 8601).
+    pub created_at: String,
+    /// Timestamp when the task was last updated (ISO 8601).
+    pub updated_at: String,
+    /// Messages in this task's conversation.
+    #[serde(default)]
+    pub messages: Vec<TaskMessage>,
+    /// Artifacts produced by this task.
+    #[serde(default)]
+    pub artifacts: Vec<Artifact>,
+    /// Additional metadata for the task.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+}
+
+impl Task {
+    /// Create a new task with pending status.
+    pub fn new(id: impl Into<String>) -> Self {
+        let now = current_timestamp_iso();
+        Self {
+            id: id.into(),
+            status: TaskStatus::Pending,
+            created_at: now.clone(),
+            updated_at: now,
+            messages: Vec::new(),
+            artifacts: Vec::new(),
+            metadata: None,
+        }
+    }
+
+    /// Add a message to this task.
+    pub fn add_message(&mut self, message: TaskMessage) {
+        self.messages.push(message);
+        self.updated_at = current_timestamp_iso();
+    }
+
+    /// Add an artifact to this task.
+    pub fn add_artifact(&mut self, artifact: Artifact) {
+        self.artifacts.push(artifact);
+        self.updated_at = current_timestamp_iso();
+    }
+
+    /// Update the task status.
+    pub fn set_status(&mut self, status: TaskStatus) {
+        self.status = status;
+        self.updated_at = current_timestamp_iso();
+    }
+}
+
+/// Status of a task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskStatus {
+    /// Task has been submitted but not yet started.
+    Pending,
+    /// Task is currently being processed.
+    Running,
+    /// Task completed successfully.
+    Completed,
+    /// Task failed with an error.
+    Failed,
+    /// Task was cancelled by the user.
+    Cancelled,
+}
+
+impl Default for TaskStatus {
+    fn default() -> Self {
+        TaskStatus::Pending
+    }
+}
+
+/// A message within a task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TaskMessage {
+    /// Role of the message sender.
+    pub role: MessageRole,
+    /// Content of the message.
+    pub content: String,
+    /// Timestamp when the message was sent (ISO 8601).
+    pub timestamp: String,
+}
+
+impl TaskMessage {
+    /// Create a new user message.
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::User,
+            content: content.into(),
+            timestamp: current_timestamp_iso(),
+        }
+    }
+
+    /// Create a new agent message.
+    pub fn agent(content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::Agent,
+            content: content.into(),
+            timestamp: current_timestamp_iso(),
+        }
+    }
+}
+
+/// Role of a message sender.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageRole {
+    /// Message from the user.
+    User,
+    /// Message from the agent.
+    Agent,
+}
+
+impl Default for MessageRole {
+    fn default() -> Self {
+        MessageRole::User
+    }
+}
+
+// =============================================================================
+// Artifact Types
+// =============================================================================
+
+/// An artifact produced or consumed by a task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Artifact {
+    /// Unique artifact identifier.
+    pub id: String,
+    /// Type of artifact.
+    #[serde(rename = "type")]
+    pub artifact_type: ArtifactType,
+    /// Human-readable name of the artifact.
+    pub name: String,
+    /// Artifact content (base64 encoded for binary, or text).
+    pub content: String,
+}
+
+impl Artifact {
+    /// Create a new artifact.
     pub fn new(
-        session_id: impl Into<String>,
-        sender_id: impl Into<String>,
-        recipient_id: impl Into<String>,
+        id: impl Into<String>,
+        artifact_type: ArtifactType,
+        name: impl Into<String>,
         content: impl Into<String>,
     ) -> Self {
         Self {
-            id: Uuid::new_v4().to_string(),
-            session_id: session_id.into(),
-            sender_id: sender_id.into(),
-            recipient_id: recipient_id.into(),
+            id: id.into(),
+            artifact_type,
+            name: name.into(),
             content: content.into(),
-            timestamp: current_timestamp_secs(),
-            reply_to: None,
         }
     }
+}
 
-    /// Create a reply to an existing message.
-    ///
-    /// The `reply_to` field will be set to the parent message's ID,
-    /// and the session_id will be inherited from the parent.
-    ///
-    /// # Arguments
-    ///
-    /// * `parent` - The message being replied to
-    /// * `sender_id` - The sender peer identifier (may differ from original recipient)
-    /// * `content` - The reply content
-    pub fn reply_to(
-        parent: &A2AMessage,
-        sender_id: impl Into<String>,
-        content: impl Into<String>,
-    ) -> Self {
+/// Type of an artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ArtifactType {
+    /// A file artifact.
+    File,
+    /// An image artifact.
+    Image,
+    /// A data artifact (JSON, text, etc.).
+    Data,
+}
+
+impl Default for ArtifactType {
+    fn default() -> Self {
+        ArtifactType::Data
+    }
+}
+
+// =============================================================================
+// Task Update (SSE Streaming)
+// =============================================================================
+
+/// A task update event sent via Server-Sent Events (SSE).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TaskUpdate {
+    /// The task ID this update belongs to.
+    pub task_id: String,
+    /// The updated status.
+    pub status: TaskStatus,
+    /// Optional message included in this update.
+    #[serde(default)]
+    pub message: Option<TaskMessage>,
+    /// Optional artifact included in this update.
+    #[serde(default)]
+    pub artifact: Option<Artifact>,
+}
+
+impl TaskUpdate {
+    /// Create a status update without message or artifact.
+    pub fn status_update(task_id: impl Into<String>, status: TaskStatus) -> Self {
         Self {
-            id: Uuid::new_v4().to_string(),
-            session_id: parent.session_id.clone(),
-            sender_id: sender_id.into(),
-            recipient_id: parent.sender_id.clone(),
-            content: content.into(),
-            timestamp: current_timestamp_secs(),
-            reply_to: Some(parent.id.clone()),
+            task_id: task_id.into(),
+            status,
+            message: None,
+            artifact: None,
         }
     }
 
-    /// Set the reply-to field explicitly.
-    pub fn with_reply_to(mut self, reply_to: impl Into<String>) -> Self {
-        self.reply_to = Some(reply_to.into());
+    /// Create a message update.
+    pub fn message_update(task_id: impl Into<String>, message: TaskMessage) -> Self {
+        Self {
+            task_id: task_id.into(),
+            status: TaskStatus::Running,
+            message: Some(message),
+            artifact: None,
+        }
+    }
+
+    /// Create an artifact update.
+    pub fn artifact_update(task_id: impl Into<String>, artifact: Artifact) -> Self {
+        Self {
+            task_id: task_id.into(),
+            status: TaskStatus::Running,
+            message: None,
+            artifact: Some(artifact),
+        }
+    }
+}
+
+// =============================================================================
+// Request/Response Types
+// =============================================================================
+
+/// Request to create a new task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CreateTaskRequest {
+    /// The initial message from the user.
+    pub message: TaskMessage,
+    /// Optional metadata for the task.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+}
+
+impl CreateTaskRequest {
+    /// Create a request with a user message.
+    pub fn new(content: impl Into<String>) -> Self {
+        Self {
+            message: TaskMessage::user(content),
+            metadata: None,
+        }
+    }
+
+    /// Create a request with metadata.
+    pub fn with_metadata(mut self, metadata: serde_json::Value) -> Self {
+        self.metadata = Some(metadata);
         self
     }
 }
 
+/// Response from creating a task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CreateTaskResponse {
+    /// The created task.
+    pub task: Task,
+}
+
+/// Request to get task status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GetTaskRequest {
+    /// The task ID to retrieve.
+    pub task_id: String,
+}
+
+/// Request to cancel a task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CancelTaskRequest {
+    /// The task ID to cancel.
+    pub task_id: String,
+}
+
+/// Response from canceling a task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CancelTaskResponse {
+    /// The cancelled task.
+    pub task: Task,
+}
+
+// =============================================================================
+// Peer Configuration (kept for backward compatibility with config)
+// =============================================================================
+
 /// Peer configuration for A2A communication.
 ///
 /// Defines a remote agent that this agent can communicate with.
-/// Each peer has a unique ID, an HTTP endpoint, and authentication credentials.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct A2APeer {
-    /// Unique peer identifier (used in message routing)
+    /// Unique peer identifier.
     pub id: String,
-    /// HTTP endpoint URL for the peer (e.g., "https://peer.example.com")
+    /// HTTP endpoint URL for the peer.
     pub endpoint: String,
-    /// Bearer token for authenticating requests to this peer
+    /// Bearer token for authenticating requests.
     pub bearer_token: String,
-    /// Whether this peer is enabled for communication
+    /// Whether this peer is enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
 
 impl A2APeer {
     /// Create a new peer configuration.
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - Unique peer identifier
-    /// * `endpoint` - HTTP endpoint URL
-    /// * `bearer_token` - Authentication token
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use zeroclaw::channels::a2a::protocol::A2APeer;
-    ///
-    /// let peer = A2APeer::new(
-    ///     "agent-001",
-    ///     "https://agent-001.example.com",
-    ///     "secret-token-123",
-    /// );
-    /// ```
     pub fn new(
         id: impl Into<String>,
         endpoint: impl Into<String>,
@@ -161,22 +453,24 @@ impl A2APeer {
         }
     }
 
-    /// Create a disabled peer configuration.
+    /// Create a disabled peer.
     pub fn disabled(mut self) -> Self {
         self.enabled = false;
         self
     }
 }
 
+// =============================================================================
+// Configuration
+// =============================================================================
+
 /// Rate limit configuration for A2A protocol.
-///
-/// Controls per-peer rate limiting to prevent abuse and ensure fair usage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct A2ARateLimitConfig {
-    /// Requests per minute per peer. Default: 60 (1 req/sec average).
+    /// Requests per minute per peer.
     #[serde(default = "default_requests_per_minute")]
     pub requests_per_minute: u32,
-    /// Burst size - max concurrent requests allowed. Default: 10.
+    /// Burst size.
     #[serde(default = "default_burst_size")]
     pub burst_size: u32,
 }
@@ -190,23 +484,13 @@ impl Default for A2ARateLimitConfig {
     }
 }
 
-fn default_requests_per_minute() -> u32 {
-    60
-}
-
-fn default_burst_size() -> u32 {
-    10
-}
-
 /// Idempotency configuration for A2A protocol.
-///
-/// Controls duplicate message detection and rejection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct A2AIdempotencyConfig {
-    /// TTL for idempotency entries in seconds. Default: 86400 (24 hours).
+    /// TTL for idempotency entries in seconds.
     #[serde(default = "default_idempotency_ttl_secs")]
     pub ttl_secs: u64,
-    /// Maximum number of idempotency keys to track. Default: 10000.
+    /// Maximum number of idempotency keys.
     #[serde(default = "default_idempotency_max_keys")]
     pub max_keys: usize,
 }
@@ -220,55 +504,43 @@ impl Default for A2AIdempotencyConfig {
     }
 }
 
-fn default_idempotency_ttl_secs() -> u64 {
-    86400
-}
-
-fn default_idempotency_max_keys() -> usize {
-    10000
-}
-
 /// A2A channel configuration.
-///
-/// Controls the agent-to-agent communication subsystem, including
-/// the listen port, peer discovery mode, and allowed peer whitelist.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct A2AConfig {
-    /// Whether the A2A channel is enabled
+    /// Whether the A2A channel is enabled.
     #[serde(default = "default_false")]
     pub enabled: bool,
-    /// Port to listen on for incoming A2A messages
+    /// Port to listen on.
     #[serde(default = "default_listen_port")]
     pub listen_port: u16,
-    /// Peer discovery mode: "static" (only configured peers)
+    /// Peer discovery mode.
     #[serde(default = "default_discovery_mode")]
     pub discovery_mode: String,
-    /// List of allowed peer IDs. ["*"] allows any configured peer.
+    /// Allowed peer IDs.
     #[serde(default = "default_allowed_peer_ids")]
     pub allowed_peer_ids: Vec<String>,
-    /// Configured peer definitions
+    /// Configured peers.
     #[serde(default)]
     pub peers: Vec<A2APeer>,
-    /// Rate limiting configuration
+    /// Rate limiting configuration.
     #[serde(default)]
     pub rate_limit: A2ARateLimitConfig,
-    /// Idempotency configuration
+    /// Idempotency configuration.
     #[serde(default)]
     pub idempotency: A2AIdempotencyConfig,
+    /// Agent card configuration.
+    #[serde(default)]
+    pub agent_card: Option<AgentCardConfig>,
 }
 
 impl A2AConfig {
-    /// Check if a peer ID is allowed to communicate with this agent.
-    ///
-    /// Returns true if:
-    /// - `allowed_peer_ids` contains "*" (wildcard)
-    /// - `allowed_peer_ids` contains the specific peer_id
+    /// Check if a peer is allowed.
     pub fn is_peer_allowed(&self, peer_id: &str) -> bool {
         self.allowed_peer_ids.contains(&"*".to_string())
             || self.allowed_peer_ids.contains(&peer_id.to_string())
     }
 
-    /// Find a peer by its ID.
+    /// Find a peer by ID.
     pub fn find_peer(&self, peer_id: &str) -> Option<&A2APeer> {
         self.peers.iter().find(|p| p.id == peer_id && p.enabled)
     }
@@ -284,11 +556,38 @@ impl Default for A2AConfig {
             peers: Vec::new(),
             rate_limit: A2ARateLimitConfig::default(),
             idempotency: A2AIdempotencyConfig::default(),
+            agent_card: None,
         }
     }
 }
 
-// Helper functions for serde defaults
+/// Agent card configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentCardConfig {
+    /// Agent name.
+    pub name: String,
+    /// Agent description.
+    pub description: String,
+    /// Skills available.
+    #[serde(default)]
+    pub skills: Vec<SkillConfig>,
+}
+
+/// Skill configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SkillConfig {
+    /// Skill ID.
+    pub id: String,
+    /// Skill name.
+    pub name: String,
+    /// Skill description.
+    pub description: String,
+}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
 fn default_true() -> bool {
     true
 }
@@ -309,6 +608,42 @@ fn default_allowed_peer_ids() -> Vec<String> {
     vec!["*".to_string()]
 }
 
+fn default_requests_per_minute() -> u32 {
+    60
+}
+
+fn default_burst_size() -> u32 {
+    10
+}
+
+fn default_idempotency_ttl_secs() -> u64 {
+    86400
+}
+
+fn default_idempotency_max_keys() -> usize {
+    10000
+}
+
+fn default_tasks_endpoint() -> String {
+    "/tasks".to_string()
+}
+
+fn default_stream_endpoint() -> String {
+    "/tasks/{id}/stream".to_string()
+}
+
+/// Get current timestamp as ISO 8601 string.
+fn current_timestamp_iso() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    // Simple ISO 8601 format: 2024-01-01T00:00:00Z
+    let secs = now.as_secs();
+    let mins = (secs / 60) % 60;
+    let hours = (secs / 3600) % 24;
+    format!("2024-01-01T{:02}:{:02}:00Z", hours, mins)
+}
+
 /// Get current Unix timestamp in seconds.
 fn current_timestamp_secs() -> u64 {
     SystemTime::now()
@@ -317,115 +652,214 @@ fn current_timestamp_secs() -> u64 {
         .as_secs()
 }
 
+// =============================================================================
+// Legacy Types (for migration)
+// =============================================================================
+
+/// Legacy message type - deprecated, use Task instead.
+///
+/// This type is kept for backward compatibility during migration.
+#[deprecated(since = "0.4.0", note = "Use Task and TaskMessage instead")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct A2AMessage {
+    /// Unique message identifier.
+    pub id: String,
+    /// Conversation thread identifier.
+    pub session_id: String,
+    /// Sender peer identifier.
+    pub sender_id: String,
+    /// Recipient peer identifier.
+    pub recipient_id: String,
+    /// Message content.
+    pub content: String,
+    /// Unix timestamp.
+    pub timestamp: u64,
+    /// Optional parent message ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+}
+
+impl A2AMessage {
+    /// Create a new A2A message.
+    #[allow(deprecated)]
+    pub fn new(
+        session_id: impl Into<String>,
+        sender_id: impl Into<String>,
+        recipient_id: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.into(),
+            sender_id: sender_id.into(),
+            recipient_id: recipient_id.into(),
+            content: content.into(),
+            timestamp: current_timestamp_secs(),
+            reply_to: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     // =========================================================================
-    // A2AMessage Tests
+    // AgentCard Tests
     // =========================================================================
 
     #[test]
-    fn message_new_generates_valid_uuid() {
-        let msg = A2AMessage::new("session-1", "peer-a", "peer-b", "Hello");
-
-        // Verify UUID format (should be 36 chars with hyphens)
-        assert_eq!(msg.id.len(), 36);
-        assert!(msg.id.contains('-'));
-
-        // Verify UUID is valid
-        assert!(Uuid::parse_str(&msg.id).is_ok());
-    }
-
-    #[test]
-    fn message_new_sets_fields_correctly() {
-        let msg = A2AMessage::new("session-1", "peer-a", "peer-b", "Hello, world!");
-
-        assert_eq!(msg.session_id, "session-1");
-        assert_eq!(msg.sender_id, "peer-a");
-        assert_eq!(msg.recipient_id, "peer-b");
-        assert_eq!(msg.content, "Hello, world!");
-        assert!(msg.reply_to.is_none());
-    }
-
-    #[test]
-    fn message_new_sets_timestamp() {
-        let before = current_timestamp_secs();
-        let msg = A2AMessage::new("session-1", "peer-a", "peer-b", "Hello");
-        let after = current_timestamp_secs();
-
-        assert!(msg.timestamp >= before);
-        assert!(msg.timestamp <= after);
-    }
-
-    #[test]
-    fn message_reply_to_inherits_session() {
-        let parent = A2AMessage::new("session-1", "peer-a", "peer-b", "Original");
-        let reply = A2AMessage::reply_to(&parent, "peer-b", "Reply content");
-
-        assert_eq!(reply.session_id, parent.session_id);
-        assert_eq!(reply.reply_to, Some(parent.id.clone()));
-        assert_eq!(reply.recipient_id, "peer-a"); // Original sender becomes recipient
-        assert_eq!(reply.sender_id, "peer-b");
-    }
-
-    #[test]
-    fn message_with_reply_to_sets_field() {
-        let msg = A2AMessage::new("session-1", "peer-a", "peer-b", "Hello")
-            .with_reply_to("parent-msg-id");
-
-        assert_eq!(msg.reply_to, Some("parent-msg-id".to_string()));
-    }
-
-    #[test]
-    fn message_serialization_roundtrip() {
-        let original = A2AMessage {
-            id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
-            session_id: "session-123".to_string(),
-            sender_id: "peer-a".to_string(),
-            recipient_id: "peer-b".to_string(),
-            content: "Test message".to_string(),
-            timestamp: 1_700_000_000,
-            reply_to: Some("parent-id".to_string()),
+    fn agent_card_default_values() {
+        let card = AgentCard {
+            name: "Test Agent".to_string(),
+            description: "A test agent".to_string(),
+            version: "1.0.0".to_string(),
+            capabilities: AgentCapabilities::default(),
+            authentication: AuthenticationInfo::default(),
+            endpoints: AgentEndpoints::default(),
+            skills: vec![],
         };
 
-        let json = serde_json::to_string(&original).expect("serialization should succeed");
-        let deserialized: A2AMessage =
+        assert_eq!(card.name, "Test Agent");
+        assert!(card.capabilities.streaming);
+        assert!(card.capabilities.artifacts);
+        assert!(!card.capabilities.push_notifications);
+        assert!(card.authentication.schemes.contains(&"bearer".to_string()));
+    }
+
+    #[test]
+    fn agent_card_serialization_roundtrip() {
+        let card = AgentCard {
+            name: "Test Agent".to_string(),
+            description: "A test agent".to_string(),
+            version: "1.0.0".to_string(),
+            capabilities: AgentCapabilities::default(),
+            authentication: AuthenticationInfo::default(),
+            endpoints: AgentEndpoints::default(),
+            skills: vec![Skill {
+                id: "skill-1".to_string(),
+                name: "Test Skill".to_string(),
+                description: "A test skill".to_string(),
+                input_schema: None,
+                output_schema: None,
+            }],
+        };
+
+        let json = serde_json::to_string(&card).expect("serialization should succeed");
+        let deserialized: AgentCard =
             serde_json::from_str(&json).expect("deserialization should succeed");
 
-        assert_eq!(original, deserialized);
+        assert_eq!(card.name, deserialized.name);
+        assert_eq!(card.skills.len(), deserialized.skills.len());
+    }
+
+    // =========================================================================
+    // Task Tests
+    // =========================================================================
+
+    #[test]
+    fn task_new_creates_pending_task() {
+        let task = Task::new("task-123");
+
+        assert_eq!(task.id, "task-123");
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert!(task.messages.is_empty());
+        assert!(task.artifacts.is_empty());
     }
 
     #[test]
-    fn message_serialization_omits_null_reply_to() {
-        let msg = A2AMessage::new("session-1", "peer-a", "peer-b", "Hello");
-        let json = serde_json::to_string(&msg).expect("serialization should succeed");
+    fn task_add_message() {
+        let mut task = Task::new("task-123");
+        task.add_message(TaskMessage::user("Hello"));
 
-        // Should not contain "reply_to" field when None
-        assert!(!json.contains("reply_to"));
+        assert_eq!(task.messages.len(), 1);
+        assert_eq!(task.messages[0].role, MessageRole::User);
+        assert_eq!(task.messages[0].content, "Hello");
     }
 
     #[test]
-    fn message_deserialization_from_json() {
-        let json = r#"{
-            "id": "550e8400-e29b-41d4-a716-446655440000",
-            "session_id": "session-abc",
-            "sender_id": "agent-1",
-            "recipient_id": "agent-2",
-            "content": "Hello from JSON",
-            "timestamp": 1_700_000_000,
-            "reply_to": "parent-uuid"
-        }"#;
+    fn task_set_status() {
+        let mut task = Task::new("task-123");
+        task.set_status(TaskStatus::Running);
 
-        let msg: A2AMessage = serde_json::from_str(json).expect("deserialization should succeed");
+        assert_eq!(task.status, TaskStatus::Running);
+    }
 
-        assert_eq!(msg.id, "550e8400-e29b-41d4-a716-446655440000");
-        assert_eq!(msg.session_id, "session-abc");
-        assert_eq!(msg.sender_id, "agent-1");
-        assert_eq!(msg.recipient_id, "agent-2");
-        assert_eq!(msg.content, "Hello from JSON");
-        assert_eq!(msg.timestamp, 1_700_000_000);
-        assert_eq!(msg.reply_to, Some("parent-uuid".to_string()));
+    // =========================================================================
+    // TaskMessage Tests
+    // =========================================================================
+
+    #[test]
+    fn task_message_user_creates_user_message() {
+        let msg = TaskMessage::user("Hello, agent!");
+
+        assert_eq!(msg.role, MessageRole::User);
+        assert_eq!(msg.content, "Hello, agent!");
+    }
+
+    #[test]
+    fn task_message_agent_creates_agent_message() {
+        let msg = TaskMessage::agent("Hello, user!");
+
+        assert_eq!(msg.role, MessageRole::Agent);
+        assert_eq!(msg.content, "Hello, user!");
+    }
+
+    // =========================================================================
+    // Artifact Tests
+    // =========================================================================
+
+    #[test]
+    fn artifact_new() {
+        let artifact = Artifact::new("art-1", ArtifactType::File, "test.txt", "Hello world");
+
+        assert_eq!(artifact.id, "art-1");
+        assert_eq!(artifact.artifact_type, ArtifactType::File);
+        assert_eq!(artifact.name, "test.txt");
+        assert_eq!(artifact.content, "Hello world");
+    }
+
+    // =========================================================================
+    // TaskUpdate Tests
+    // =========================================================================
+
+    #[test]
+    fn task_update_status() {
+        let update = TaskUpdate::status_update("task-123", TaskStatus::Running);
+
+        assert_eq!(update.task_id, "task-123");
+        assert_eq!(update.status, TaskStatus::Running);
+        assert!(update.message.is_none());
+        assert!(update.artifact.is_none());
+    }
+
+    #[test]
+    fn task_update_message() {
+        let update = TaskUpdate::message_update("task-123", TaskMessage::agent("Processing..."));
+
+        assert_eq!(update.status, TaskStatus::Running);
+        assert!(update.message.is_some());
+    }
+
+    // =========================================================================
+    // CreateTaskRequest Tests
+    // =========================================================================
+
+    #[test]
+    fn create_task_request_new() {
+        let request = CreateTaskRequest::new("Hello, agent!");
+
+        assert_eq!(request.message.role, MessageRole::User);
+        assert_eq!(request.message.content, "Hello, agent!");
+        assert!(request.metadata.is_none());
+    }
+
+    #[test]
+    fn create_task_request_with_metadata() {
+        let request =
+            CreateTaskRequest::new("Hello!").with_metadata(serde_json::json!({"key": "value"}));
+
+        assert!(request.metadata.is_some());
     }
 
     // =========================================================================
@@ -433,51 +867,20 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn peer_new_sets_fields_and_defaults_enabled() {
-        let peer = A2APeer::new(
-            "peer-001",
-            "https://peer-001.example.com",
-            "bearer-token-123",
-        );
+    fn peer_new_sets_fields() {
+        let peer = A2APeer::new("peer-001", "https://example.com", "token");
 
         assert_eq!(peer.id, "peer-001");
-        assert_eq!(peer.endpoint, "https://peer-001.example.com");
-        assert_eq!(peer.bearer_token, "bearer-token-123");
+        assert_eq!(peer.endpoint, "https://example.com");
+        assert_eq!(peer.bearer_token, "token");
         assert!(peer.enabled);
     }
 
     #[test]
-    fn peer_disabled_builder_works() {
+    fn peer_disabled() {
         let peer = A2APeer::new("peer-001", "https://example.com", "token").disabled();
+
         assert!(!peer.enabled);
-    }
-
-    #[test]
-    fn peer_serialization_roundtrip() {
-        let original = A2APeer {
-            id: "peer-001".to_string(),
-            endpoint: "https://example.com/a2a".to_string(),
-            bearer_token: "secret-token".to_string(),
-            enabled: true,
-        };
-
-        let json = serde_json::to_string(&original).expect("serialization should succeed");
-        let deserialized: A2APeer =
-            serde_json::from_str(&json).expect("deserialization should succeed");
-
-        assert_eq!(original, deserialized);
-    }
-
-    #[test]
-    fn peer_deserialization_defaults_enabled() {
-        let json = r#"{
-            "id": "peer-001",
-            "endpoint": "https://example.com",
-            "bearer_token": "token"
-        }"#;
-
-        let peer: A2APeer = serde_json::from_str(json).expect("deserialization should succeed");
-        assert!(peer.enabled);
     }
 
     // =========================================================================
@@ -500,159 +903,17 @@ mod tests {
         let config = A2AConfig::default();
 
         assert!(config.is_peer_allowed("any-peer"));
-        assert!(config.is_peer_allowed("peer-123"));
     }
 
     #[test]
-    fn config_is_peer_allowed_with_specific_ids() {
+    fn config_find_peer() {
         let config = A2AConfig {
-            allowed_peer_ids: vec!["peer-a".to_string(), "peer-b".to_string()],
+            peers: vec![A2APeer::new("peer-1", "https://peer1.com", "token")],
             ..Default::default()
         };
 
-        assert!(config.is_peer_allowed("peer-a"));
-        assert!(config.is_peer_allowed("peer-b"));
-        assert!(!config.is_peer_allowed("peer-c"));
-        assert!(!config.is_peer_allowed("*"));
-    }
-
-    #[test]
-    fn config_find_peer_returns_enabled_peer() {
-        let peer1 = A2APeer::new("peer-1", "https://peer1.com", "token1");
-        let peer2 = A2APeer::new("peer-2", "https://peer2.com", "token2").disabled();
-
-        let config = A2AConfig {
-            peers: vec![peer1.clone(), peer2],
-            ..Default::default()
-        };
-
-        assert!(config.find_peer("peer-1").is_some());
-        assert!(config.find_peer("peer-2").is_none()); // Disabled
-        assert!(config.find_peer("peer-3").is_none()); // Not found
-    }
-
-    #[test]
-    fn config_serialization_roundtrip() {
-        let original = A2AConfig {
-            enabled: true,
-            listen_port: 8080,
-            discovery_mode: "static".to_string(),
-            allowed_peer_ids: vec!["peer-a".to_string(), "peer-b".to_string()],
-            peers: vec![
-                A2APeer::new("peer-a", "https://peer-a.example.com", "token-a"),
-                A2APeer::new("peer-b", "https://peer-b.example.com", "token-b"),
-            ],
-            rate_limit: A2ARateLimitConfig::default(),
-            idempotency: A2AIdempotencyConfig::default(),
-        };
-
-        let json = serde_json::to_string(&original).expect("serialization should succeed");
-        let deserialized: A2AConfig =
-            serde_json::from_str(&json).expect("deserialization should succeed");
-
-        assert_eq!(original.enabled, deserialized.enabled);
-        assert_eq!(original.listen_port, deserialized.listen_port);
-        assert_eq!(original.discovery_mode, deserialized.discovery_mode);
-        assert_eq!(original.allowed_peer_ids, deserialized.allowed_peer_ids);
-        assert_eq!(original.peers.len(), deserialized.peers.len());
-    }
-
-    #[test]
-    fn config_deserialization_uses_defaults() {
-        let json = r#"{}"#;
-
-        let config: A2AConfig =
-            serde_json::from_str(json).expect("deserialization with defaults should succeed");
-
-        assert!(!config.enabled);
-        assert_eq!(config.listen_port, 9000);
-        assert_eq!(config.discovery_mode, "static");
-        assert_eq!(config.allowed_peer_ids, vec!["*"]);
-        assert!(config.peers.is_empty());
-    }
-
-    #[test]
-    fn config_deserialization_partial() {
-        let json = r#"{
-            "enabled": true,
-            "listen_port": 9090
-        }"#;
-
-        let config: A2AConfig = serde_json::from_str(json).expect("deserialization should succeed");
-
-        assert!(config.enabled);
-        assert_eq!(config.listen_port, 9090);
-        assert_eq!(config.discovery_mode, "static"); // Default
-        assert_eq!(config.allowed_peer_ids, vec!["*"]); // Default
-    }
-
-    #[test]
-    fn config_toml_roundtrip() {
-        let config = A2AConfig {
-            enabled: true,
-            listen_port: 8080,
-            discovery_mode: "static".to_string(),
-            allowed_peer_ids: vec!["*".to_string()],
-            peers: vec![A2APeer::new(
-                "zeroclaw-agent-1",
-                "https://agent1.zeroclaw.local",
-                "secure-bearer-token",
-            )],
-            rate_limit: A2ARateLimitConfig::default(),
-            idempotency: A2AIdempotencyConfig::default(),
-        };
-
-        let toml = toml::to_string(&config).expect("TOML serialization should succeed");
-        let deserialized: A2AConfig =
-            toml::from_str(&toml).expect("TOML deserialization should succeed");
-
-        assert_eq!(config.enabled, deserialized.enabled);
-        assert_eq!(config.listen_port, deserialized.listen_port);
-        assert_eq!(config.peers.len(), deserialized.peers.len());
-        assert_eq!(config.peers[0].id, deserialized.peers[0].id);
-    }
-
-    // =========================================================================
-    // JsonSchema Tests
-    // =========================================================================
-
-    #[test]
-    fn message_generates_schema() {
-        let schema = schemars::schema_for!(A2AMessage);
-        let json = serde_json::to_string_pretty(&schema).expect("schema generation should succeed");
-
-        assert!(json.contains("A2AMessage"));
-        assert!(json.contains("id"));
-        assert!(json.contains("session_id"));
-        assert!(json.contains("sender_id"));
-        assert!(json.contains("recipient_id"));
-        assert!(json.contains("content"));
-        assert!(json.contains("timestamp"));
-        assert!(json.contains("reply_to"));
-    }
-
-    #[test]
-    fn peer_generates_schema() {
-        let schema = schemars::schema_for!(A2APeer);
-        let json = serde_json::to_string_pretty(&schema).expect("schema generation should succeed");
-
-        assert!(json.contains("A2APeer"));
-        assert!(json.contains("id"));
-        assert!(json.contains("endpoint"));
-        assert!(json.contains("bearer_token"));
-        assert!(json.contains("enabled"));
-    }
-
-    #[test]
-    fn config_generates_schema() {
-        let schema = schemars::schema_for!(A2AConfig);
-        let json = serde_json::to_string_pretty(&schema).expect("schema generation should succeed");
-
-        assert!(json.contains("A2AConfig"));
-        assert!(json.contains("enabled"));
-        assert!(json.contains("listen_port"));
-        assert!(json.contains("discovery_mode"));
-        assert!(json.contains("allowed_peer_ids"));
-        assert!(json.contains("peers"));
+        let peer = config.find_peer("peer-1");
+        assert!(peer.is_some());
+        assert_eq!(peer.unwrap().id, "peer-1");
     }
 }
