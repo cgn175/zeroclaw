@@ -341,19 +341,29 @@ allowed_contacts = ["*"]
 
 ### 4.15 A2A (Agent-to-Agent)
 
-The A2A channel enables direct communication between ZeroClaw agents over HTTP/2 without third-party services.
+The A2A channel implements the **Google A2A Protocol** standard for interoperable agent-to-agent communication.
 
 ```toml
 [channels_config.a2a]
 enabled = true
 listen_port = 9000
 discovery_mode = "static"
-allowed_peer_ids = ["*"]
+allowed_peer_ids = ["*"]  # Or specific peer IDs
+
+# Optional: Customize your AgentCard
+[channels_config.a2a.agent_card]
+name = "My ZeroClaw Agent"
+description = "Autonomous AI assistant"
+
+[[channels_config.a2a.agent_card.skills]]
+id = "code-review"
+name = "Code Review"
+description = "Review code for quality and security"
 
 [[channels_config.a2a.peers]]
-id = "agent-alpha"
-endpoint = "https://192.168.1.100:9000"
-bearer_token = "encrypted:..."
+id = "peer-agent-1"
+endpoint = "https://peer.example.com:9000"
+bearer_token = "your-bearer-token-here"
 enabled = true
 
 [channels_config.a2a.rate_limit]
@@ -368,10 +378,11 @@ max_retries = 10
 
 A2A notes:
 
-- Uses HTTP/2 + SSE for bidirectional streaming
-- Bearer tokens are exchanged via pairing flow (`zeroclaw channel pair-a2a`)
-- Reconnection uses exponential backoff (2s, 4s, 8s... up to 60s)
-- TLS is enforced for all non-localhost endpoints
+- Implements [Google A2A Protocol](https://github.com/google/A2A) standard
+- Task-based model: AgentCard, Task, TaskMessage, TaskUpdate
+- Standard endpoints: `/.well-known/agent.json`, `/tasks`, `/tasks/{id}/stream`
+- Bearer tokens are configured statically (no dynamic pairing)
+- TLS recommended for production deployments
 - See [A2A Setup Guide](./a2a-setup.md) for detailed configuration
 
 ---

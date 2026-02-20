@@ -2,24 +2,38 @@
 
 ## Overview
 
-ZeroClaw's A2A protocol enables direct agent-to-agent communication without third-party channels (Telegram, Discord, etc.). Agents communicate over HTTP/2 with Server-Sent Events (SSE) for bidirectional streaming.
+ZeroClaw implements the **Google A2A Protocol** standard for agent-to-agent communication. This enables direct, interoperable communication between AI agents without third-party channels.
+
+**Protocol:** [Google A2A Standard](https://github.com/google/A2A)  
+**Version:** 1.0  
+**Transport:** HTTP/HTTPS with Server-Sent Events (SSE)
 
 ## Architecture
 
-- **Transport**: HTTP/2 + SSE for bidirectional communication
-- **Authentication**: Bearer token authentication per peer
-- **Discovery**: Static peer discovery via configuration
-- **Message Format**: JSON with UUID-based message tracking
-- **Default Port**: 9000 (dedicated A2A port)
+The Google A2A protocol uses a **task-based model**:
 
 ```
 Agent A                          Agent B
    |                                |
-   |--POST /a2a/send--------------->| (send message)
-   |                                | (process via agent loop)
-   |<--SSE /a2a/stream/:session_id--| (stream response)
+   |--GET /.well-known/agent.json->| (discover capabilities)
+   |<--AgentCard-------------------| 
+   |                                |
+   |--POST /tasks------------------>| (create task with message)
+   |<--Task (pending)---------------| 
+   |                                |
+   |--GET /tasks/{id}/stream------->| (subscribe to updates)
+   |<--SSE: TaskUpdate (running)----| 
+   |<--SSE: TaskUpdate (completed)--| 
    |                                |
 ```
+
+### Key Concepts
+
+- **AgentCard**: Describes agent capabilities, skills, and endpoints
+- **Task**: Unit of work containing messages, artifacts, and status
+- **TaskMessage**: Individual message within a task
+- **TaskUpdate**: Real-time status/result updates via SSE
+- **Bearer Token**: Static authentication per peer
 
 ## Quick Start
 
@@ -32,45 +46,88 @@ Add to `~/.zeroclaw/config.toml`:
 enabled = true
 listen_port = 9000
 discovery_mode = "static"
-allowed_peer_ids = ["*"]
+allowed_peer_ids = ["*"]  # Or specific peer IDs
+
+# Optional: Customize your AgentCard
+[channels_config.a2a.agent_card]
+name = "My ZeroClaw Agent"
+description = "Autonomous AI assistant"
+
+[[channels_config.a2a.agent_card.skills]]
+id = "code-review"
+name = "Code Review"
+description = "Review code for quality and security"
 
 [[channels_config.a2a.peers]]
-id = "agent-alpha"
-endpoint = "https://192.168.1.100:9000"
-bearer_token = "encrypted:..."
+id = "peer-agent-1"
+endpoint = "https://peer.example.com:9000"
+bearer_token = "your-bearer-token-here"
 enabled = true
 ```
 
-### 2. Pair with a Peer
+### 2. Discover a Peer Agent
 
 ```bash
-# Initiate pairing with a remote agent
-zeroclaw channel pair-a2a https://peer.example.com:9000
+# Fetch the peer's AgentCard
+curl https://peer.example.com:9000/.well-known/agent.json
 
-# Enter the 6-digit pairing code when prompted
-# The bearer token will be automatically encrypted and stored
+# Response:
+# {
+#   "name": "Peer Agent",
+#   "description": "...",
+#   "version": "0.1.0",
+#   "capabilities": {...},
+#   "skills": [...]
+# }
 ```
 
-### 3. Test Connectivity
+### 3. Create a Task
 
 ```bash
-# Test a specific peer
-zeroclaw channel test-a2a-peer agent-alpha
+# Send a task to a peer
+curl -X POST https://peer.example.com:9000/tasks \
+  -H "Authorization: Bearer your-token" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "message": {
+      "role": "user",
+      "content": "Review this code: fn main() { println!(\"Hello\"); }"
+    }
+  }'
 
-# Send a test message
-zeroclaw channel send-a2a agent-alpha "Hello from my agent!"
-
-# List all configured peers
-zeroclaw channel list-a2a-peers
+# Response:
+# {
+#   "task": {
+#     "id": "task-123",
+#     "status": "pending",
+#     "messages": [...],
+#     "created_at": "2026-02-20T16:00:00Z"
+#   }
+# }
 ```
 
-### 4. Start the Daemon
+### 4. Stream Task Updates
+
+```bash
+# Subscribe to task updates via SSE
+curl -N https://peer.example.com:9000/tasks/task-123/stream \
+  -H "Authorization: Bearer your-token"
+
+# SSE stream:
+# data: {"status":"running","message":"Processing..."}
+# data: {"status":"completed","result":"Code looks good!"}
+```
+
+### 5. Start the Daemon
 
 ```bash
 zeroclaw daemon
 ```
 
-The A2A channel will listen on the configured port and establish SSE connections to all enabled peers.
+The A2A channel will:
+- Serve your AgentCard at `/.well-known/agent.json`
+- Accept task creation at `/tasks`
+- Stream task updates at `/tasks/{id}/stream`
 
 ## Configuration Reference
 
@@ -79,20 +136,33 @@ The A2A channel will listen on the configured port and establish SSE connections
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Enable A2A channel |
-| `listen_port` | u16 | `9000` | Port to listen on for incoming A2A connections |
-| `discovery_mode` | string | `"static"` | Peer discovery mode (only `"static"` supported in v1) |
-| `allowed_peer_ids` | [string] | `["*"]` | Allowed peer IDs (`"*"` allows all, empty denies all) |
+| `listen_port` | u16 | `9000` | Port to listen on |
+| `discovery_mode` | string | `"static"` | Peer discovery mode |
+| `allowed_peer_ids` | [string] | `[]` | Allowed peer IDs (`"*"` = all, `[]` = deny all) |
+
+### AgentCard Configuration
+
+```toml
+[channels_config.a2a.agent_card]
+name = "My Agent"
+description = "What this agent does"
+
+[[channels_config.a2a.agent_card.skills]]
+id = "skill-id"
+name = "Skill Name"
+description = "What this skill does"
+```
 
 ### Peer Configuration
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `id` | string | yes | Unique peer identifier |
-| `endpoint` | string | yes | Peer URL (e.g., `https://192.168.1.100:9000`) |
-| `bearer_token` | string | yes | Authentication token (stored encrypted) |
+| `endpoint` | string | yes | Peer base URL (e.g., `https://peer.example.com:9000`) |
+| `bearer_token` | string | yes | Static authentication token |
 | `enabled` | bool | yes | Whether to connect to this peer |
 
-### Rate Limiting
+### Rate Limiting (Optional)
 
 ```toml
 [channels_config.a2a.rate_limit]
@@ -100,7 +170,7 @@ requests_per_minute = 60
 burst_size = 10
 ```
 
-### Connection Resilience
+### Connection Resilience (Optional)
 
 ```toml
 [channels_config.a2a.reconnect]
@@ -109,19 +179,29 @@ max_delay_secs = 60
 max_retries = 10
 ```
 
-Reconnection uses exponential backoff: 2s, 4s, 8s, 16s, 32s, then caps at 60s.
+## Google A2A Endpoints
+
+ZeroClaw implements these standard endpoints:
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/.well-known/agent.json` | GET | None | Agent discovery (AgentCard) |
+| `/tasks` | POST | Bearer | Create a new task |
+| `/tasks/{id}` | GET | Bearer | Get task status and result |
+| `/tasks/{id}/stream` | GET | Bearer | Subscribe to task updates (SSE) |
+| `/tasks/{id}/cancel` | POST | Bearer | Cancel a running task |
 
 ## Security Considerations
 
-- **TLS Required**: Always use HTTPS for production endpoints (enforced except for localhost)
-- **Bearer Tokens**: Encrypted at rest using the configured secrets provider
-- **Pairing Codes**: Expire after 5 minutes; single-use only
-- **Allowlist**: Empty `allowed_peer_ids` denies all inbound connections (deny-by-default)
-- **Rate Limiting**: Prevents abuse and retry-loop storms
+- **TLS Recommended**: Use HTTPS for production deployments
+- **Bearer Tokens**: Static tokens stored in config (consider encryption)
+- **Allowlist**: Empty `allowed_peer_ids` denies all inbound connections
+- **Rate Limiting**: Prevents abuse and DoS attacks
+- **No Dynamic Pairing**: Tokens are configured statically (no pairing flow)
 
 ## Multi-Agent Setup Example
 
-Configure three agents that can all communicate with each other:
+Configure three agents in a mesh network:
 
 **Agent Alpha** (`~/.zeroclaw/config.toml`):
 ```toml
@@ -130,80 +210,64 @@ enabled = true
 listen_port = 9000
 allowed_peer_ids = ["agent-beta", "agent-gamma"]
 
+[channels_config.a2a.agent_card]
+name = "Agent Alpha"
+description = "Primary coordinator agent"
+
 [[channels_config.a2a.peers]]
 id = "agent-beta"
 endpoint = "https://192.168.1.101:9000"
-bearer_token = "encrypted:..."
+bearer_token = "beta-token-123"
 enabled = true
 
 [[channels_config.a2a.peers]]
 id = "agent-gamma"
 endpoint = "https://192.168.1.102:9000"
-bearer_token = "encrypted:..."
+bearer_token = "gamma-token-456"
 enabled = true
 ```
 
-**Agent Beta** (`~/.zeroclaw/config.toml`):
-```toml
-[channels_config.a2a]
-enabled = true
-listen_port = 9000
-allowed_peer_ids = ["agent-alpha", "agent-gamma"]
-
-[[channels_config.a2a.peers]]
-id = "agent-alpha"
-endpoint = "https://192.168.1.100:9000"
-bearer_token = "encrypted:..."
-enabled = true
-
-[[channels_config.a2a.peers]]
-id = "agent-gamma"
-endpoint = "https://192.168.1.102:9000"
-bearer_token = "encrypted:..."
-enabled = true
-```
+**Agent Beta** and **Agent Gamma**: Similar configuration with appropriate peer endpoints.
 
 ## Troubleshooting
 
 ### Connection refused
 
-- Check firewall rules allow traffic on `listen_port`
-- Verify the peer's endpoint URL is correct and reachable
-- Confirm the peer agent is running and A2A is enabled
-
 ```bash
-# Test connectivity manually
-curl -k https://<peer-endpoint>/a2a/health
+# Test if peer is reachable
+curl https://peer.example.com:9000/.well-known/agent.json
+
+# Check firewall rules
+sudo ufw status
 ```
 
-### Authentication failed
+### Authentication failed (401/403)
 
-- Verify the bearer token is correct and not expired
-- Re-pair if the token was regenerated on the peer
-- Check that `allowed_peer_ids` includes the sender's ID
+- Verify bearer token matches peer's configuration
+- Check that your peer ID is in the peer's `allowed_peer_ids`
+- Ensure `Authorization: Bearer <token>` header is present
 
-```bash
-# Re-pair with a peer
-zeroclaw channel pair-a2a https://peer.example.com:9000
-```
+### Task not found (404)
 
-### Rate limit exceeded
-
-- Adjust `rate_limit` configuration if legitimate traffic is being throttled
-- Check for retry loops in client code that may be causing excessive requests
-- Review logs for repeated message IDs (indicating duplicate submissions)
+- Task IDs are ephemeral (not persisted across restarts)
+- Verify task was created successfully (check response)
+- Check task ID is correct in the URL
 
 ### SSE stream disconnects
 
-- Check network stability between agents
-- Verify reconnection configuration in logs
-- Increase `max_retries` if network is intermittently unstable
+- Network instability between agents
+- Increase `max_retries` in reconnect config
+- Check for firewall/proxy timeouts on long-lived connections
 
-### Message not received
+## Current Limitations
 
-- Confirm sender is in the recipient's `allowed_peer_ids`
-- Check that the recipient's `listen_port` is not blocked by firewall
-- Verify the session ID is consistent for conversation threading
+⚠️ **Note:** The following features are not yet fully implemented:
+
+1. **Task Streaming**: The `listen()` method is stubbed and does not actively stream task updates
+2. **Task Persistence**: Tasks are not stored; they exist only in memory
+3. **Task Processing**: Task creation returns a stub response; no actual agent processing yet
+
+These will be implemented in future updates. See `docs/a2a-cleanup-progress.md` for status.
 
 ## Log Keywords
 
@@ -211,15 +275,16 @@ Use these keywords to filter A2A-related log events:
 
 | Signal Type | Log Keyword |
 |-------------|-------------|
-| Startup / healthy | `A2A channel listening on port` |
-| Peer connected | `A2A: connected to peer` |
-| Authorization failure | `A2A: rejected message from unauthorized peer` |
-| Transport failure | `A2A: connection error` / `A2A: reconnecting to peer` |
-| Rate limited | `A2A: rate limit exceeded for peer` |
+| Startup | `A2A channel listening on port` |
+| AgentCard request | `Agent card requested` |
+| Task created | `A2A task created` |
+| Authorization failure | `Unauthorized` / `Forbidden` |
+| Task stream | `A2A task stream requested` |
 
 ## See Also
 
-- [Channels Reference](./channels-reference.md) — Complete channel configuration reference
+- [Google A2A Protocol Specification](https://github.com/google/A2A)
+- [Channels Reference](./channels-reference.md) — Complete channel configuration
 - [Config Reference](./config-reference.md) — General configuration options
 - [Troubleshooting](./troubleshooting.md) — General troubleshooting guide
-- [A2A Implementation Plan](./a2a-implementation-plan.md) — Technical implementation details
+- [A2A Cleanup Progress](./a2a-cleanup-progress.md) — Implementation status
