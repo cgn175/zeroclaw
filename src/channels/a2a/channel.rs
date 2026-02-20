@@ -227,16 +227,19 @@ impl A2AChannel {
         Some(peer)
     }
 
-    /// Convert an A2A message to a channel message.
-    fn a2a_to_channel_message(msg: &A2AMessage) -> ChannelMessage {
+    /// Convert a Google A2A TaskUpdate to a channel message.
+    fn task_update_to_channel_message(
+        task_id: &str,
+        update: &crate::channels::a2a::protocol::TaskUpdate,
+    ) -> ChannelMessage {
         ChannelMessage {
-            id: format!("a2a_{}", msg.id),
-            sender: msg.sender_id.clone(),
-            reply_target: msg.sender_id.clone(),
-            content: msg.content.clone(),
+            id: format!("a2a_task_{}", task_id),
+            sender: "a2a_peer".to_string(),
+            reply_target: "a2a_peer".to_string(),
+            content: format!("{:?}", update),
             channel: "a2a".to_string(),
-            timestamp: msg.timestamp,
-            thread_ts: Some(msg.session_id.clone()),
+            timestamp: chrono::Utc::now().timestamp() as u64,
+            thread_ts: Some(task_id.to_string()),
         }
     }
 
@@ -379,272 +382,15 @@ impl Channel for A2AChannel {
     /// Uses exponential backoff (2s, 4s, 8s, 16s, 32s, capped at 60s)
     /// with a maximum of 10 retries per peer connection. Failed peers
     /// are periodically recovered via health check background task.
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        let peers: Vec<A2APeer> = self
-            .peers
-            .values()
-            .filter(|p| p.enabled && self.config.is_peer_allowed(&p.id))
-            .cloned()
-            .collect();
-
-        if peers.is_empty() {
-            tracing::warn!("A2A: No enabled peers to listen to");
-            // Sleep indefinitely since there's nothing to listen to
-            loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }
+    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        // TODO: Implement Google A2A task stream listening
+        // This should connect to /tasks/{id}/stream endpoints for active tasks
+        tracing::warn!("A2A listen not yet implemented for Google A2A protocol");
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
         }
-
-        tracing::info!("A2A: Starting SSE listeners for {} peer(s)", peers.len());
-
-        // Create shared peer connection state
-        let peer_connections: Arc<Mutex<Vec<PeerConnection>>> = Arc::new(Mutex::new(
-            peers
-                .iter()
-                .map(|p| PeerConnection::new(p.clone()))
-                .collect(),
-        ));
-
-        // Spawn health check recovery background task
-        let health_check_client = self.http_client.clone();
-        let health_check_connections = Arc::clone(&peer_connections);
-        let health_check_handle = tokio::spawn(async move {
-            Self::health_check_recovery(
-                health_check_connections,
-                health_check_client,
-                Duration::from_secs(30), // Check every 30 seconds
-            )
-            .await;
-        });
-
-        // Spawn a task for each peer to listen to its SSE stream
-        let mut handles = Vec::new();
-        let reconnect_config = self.reconnect_config.clone();
-
-        // Clone peers to avoid lifetime issues with tokio::spawn
-        let peers_owned = peers.clone();
-
-        for (index, peer) in peers_owned.into_iter().enumerate() {
-            let http_client = self.http_client.clone();
-            let tx = tx.clone();
-            let peer_id = peer.id.clone();
-            let peer_connections = Arc::clone(&peer_connections);
-            let config = reconnect_config.clone();
-
-            let handle = tokio::spawn(async move {
-                loop {
-                    // Check if peer is in Failed state (wait for health check recovery)
-                    {
-                        let connections = peer_connections.lock().await;
-                        if connections[index].state == PeerState::Failed {
-                            tracing::debug!(
-                                "A2A: Peer {} is in Failed state, waiting for health check recovery",
-                                peer_id
-                            );
-                            drop(connections); // Release lock before sleeping
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                            continue;
-                        }
-                    }
-
-                    // Mark as connecting
-                    {
-                        let mut connections = peer_connections.lock().await;
-                        connections[index].state = PeerState::Connecting;
-                    }
-
-                    let url = Self::peer_sse_url(&peer);
-                    tracing::debug!("A2A: Connecting to peer {} SSE stream at {}", peer_id, url);
-
-                    match http_client
-                        .get(&url)
-                        .header("Authorization", format!("Bearer {}", peer.bearer_token))
-                        .header("Accept", "text/event-stream")
-                        .send()
-                        .await
-                    {
-                        Ok(response) => {
-                            if !response.status().is_success() {
-                                tracing::warn!(
-                                    "A2A: Peer {} returned status {} for SSE connection",
-                                    peer_id,
-                                    response.status()
-                                );
-
-                                // Increment retry count
-                                let mut connections = peer_connections.lock().await;
-                                let retry_count = connections[index].increment_retry();
-
-                                if retry_count > config.max_retries {
-                                    tracing::error!(
-                                        "A2A: Max retries exceeded for peer {}, marking as Failed",
-                                        peer_id
-                                    );
-                                    connections[index].mark_failed();
-                                    continue; // Continue to wait for health check recovery
-                                }
-
-                                let delay = calculate_backoff_delay(retry_count, &config);
-                                drop(connections); // Release lock before sleeping
-                                tracing::debug!(
-                                    "A2A: Reconnecting to peer {} in {:?} (retry {})",
-                                    peer_id,
-                                    delay,
-                                    retry_count
-                                );
-                                tokio::time::sleep(delay).await;
-                                continue;
-                            }
-
-                            // Connection successful - mark as connected and reset retry count
-                            {
-                                let mut connections = peer_connections.lock().await;
-                                connections[index].mark_connected();
-                                tracing::info!("A2A: Successfully connected to peer {}", peer_id);
-                            }
-
-                            // Process the SSE stream
-                            let mut stream = response.bytes_stream();
-                            let mut buffer = String::new();
-                            let mut stream_ended_gracefully = true;
-
-                            while let Some(chunk_result) = stream.next().await {
-                                match chunk_result {
-                                    Ok(chunk) => {
-                                        // Convert bytes to string and process
-                                        match std::str::from_utf8(&chunk) {
-                                            Ok(text) => {
-                                                buffer.push_str(text);
-
-                                                // Process complete SSE events (separated by double newline)
-                                                while let Some(pos) = buffer.find("\n\n") {
-                                                    let event = buffer[..pos].to_string();
-                                                    buffer = buffer[pos + 2..].to_string();
-
-                                                    // Parse the SSE event
-                                                    if let Some(data_line) = event
-                                                        .lines()
-                                                        .find(|l| l.starts_with("data:"))
-                                                    {
-                                                        let data = &data_line[5..].trim();
-
-                                                        // Try to parse as A2AMessage
-                                                        match serde_json::from_str::<A2AMessage>(
-                                                            data,
-                                                        ) {
-                                                            Ok(a2a_msg) => {
-                                                                // Validate peer is allowed
-                                                                let channel_msg =
-                                                                    Self::a2a_to_channel_message(
-                                                                        &a2a_msg,
-                                                                    );
-                                                                if tx
-                                                                    .send(channel_msg)
-                                                                    .await
-                                                                    .is_err()
-                                                                {
-                                                                    tracing::debug!("A2A: Channel closed, stopping listener for peer {}", peer_id);
-                                                                    return;
-                                                                }
-                                                            }
-                                                            Err(e) => {
-                                                                tracing::warn!("A2A: Failed to parse message from peer {}: {}", peer_id, e);
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    "A2A: Invalid UTF-8 from peer {}: {}",
-                                                    peer_id,
-                                                    e
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "A2A: Stream error from peer {}: {}",
-                                            peer_id,
-                                            e
-                                        );
-                                        stream_ended_gracefully = false;
-                                        break; // Break to trigger reconnection
-                                    }
-                                }
-                            }
-
-                            if stream_ended_gracefully {
-                                tracing::info!(
-                                    "A2A: SSE stream ended gracefully for peer {}, reconnecting...",
-                                    peer_id
-                                );
-                            } else {
-                                tracing::warn!(
-                                    "A2A: SSE stream error for peer {}, reconnecting...",
-                                    peer_id
-                                );
-                            }
-
-                            // Mark as disconnected before retry
-                            {
-                                let mut connections = peer_connections.lock().await;
-                                connections[index].mark_disconnected();
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("A2A: Failed to connect to peer {}: {}", peer_id, e);
-
-                            // Increment retry count
-                            let mut connections = peer_connections.lock().await;
-                            let retry_count = connections[index].increment_retry();
-
-                            if retry_count > config.max_retries {
-                                tracing::error!(
-                                    "A2A: Max retries exceeded for peer {}, marking as Failed",
-                                    peer_id
-                                );
-                                connections[index].mark_failed();
-                                continue; // Continue to wait for health check recovery
-                            }
-
-                            let delay = calculate_backoff_delay(retry_count, &config);
-                            drop(connections); // Release lock before sleeping
-                            tracing::debug!(
-                                "A2A: Reconnecting to peer {} in {:?} (retry {})",
-                                peer_id,
-                                delay,
-                                retry_count
-                            );
-                            tokio::time::sleep(delay).await;
-                        }
-                    }
-                }
-            });
-
-            handles.push(handle);
-        }
-
-        // Wait for all listeners (they run indefinitely unless they hit max retries)
-        // The health check recovery task runs indefinitely
-        tokio::select! {
-            _ = async {
-                for handle in handles {
-                    let _ = handle.await;
-                }
-            } => {},
-            _ = health_check_handle => {},
-        }
-
-        Ok(())
     }
 
-    /// Check if the channel is healthy by pinging all peers.
-    ///
-    /// Returns `true` if at least one peer responds successfully.
-    /// This follows a "best effort" approach where partial connectivity
-    /// is considered healthy.
     async fn health_check(&self) -> bool {
         let peers: Vec<&A2APeer> = self.peers.values().filter(|p| p.enabled).collect();
 

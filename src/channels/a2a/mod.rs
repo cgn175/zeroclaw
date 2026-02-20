@@ -45,7 +45,6 @@
 
 pub mod channel;
 pub mod pairing;
-pub mod processor;
 pub mod protocol;
 
 pub use channel::A2AChannel;

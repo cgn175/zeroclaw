@@ -179,45 +179,6 @@ and connection status (if available).
 Examples:
   zeroclaw channel list-a2a-peers")]
     ListA2aPeers,
-    /// Test connectivity to an A2A peer
-    #[command(long_about = "\
-Test connectivity to a configured A2A peer.
-
-Sends a health check request to the peer and displays the result.
-
-Examples:
-  zeroclaw channel test-a2a-peer peer_abc123")]
-    TestA2aPeer {
-        /// Peer ID to test
-        peer_id: String,
-    },
-    /// Send a test message to an A2A peer
-    #[command(long_about = "\
-Send a test message to a configured A2A peer.
-
-Constructs an A2A message and POSTs it to the peer's /a2a/send endpoint.
-
-Examples:
-  zeroclaw channel send-a2a peer_abc123 \"Hello from ZeroClaw!\"")]
-    SendA2a {
-        /// Peer ID to send to
-        peer_id: String,
-        /// Message content
-        message: String,
-    },
-    /// Remove an A2A peer from configuration
-    #[command(long_about = "\
-Remove an A2A peer from the configuration.
-
-This removes the peer from the config file. The peer will no longer
-be able to communicate with this agent.
-
-Examples:
-  zeroclaw channel remove-a2a-peer peer_abc123")]
-    RemoveA2aPeer {
-        /// Peer ID to remove
-        peer_id: String,
-    },
 }
 
 /// Skills management subcommands

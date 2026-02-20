@@ -1979,15 +1979,6 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
         crate::ChannelCommands::ListA2aPeers => {
             anyhow::bail!("ListA2aPeers must be handled in main.rs (requires async runtime)")
         }
-        crate::ChannelCommands::TestA2aPeer { .. } => {
-            anyhow::bail!("TestA2aPeer must be handled in main.rs (requires async runtime)")
-        }
-        crate::ChannelCommands::SendA2a { .. } => {
-            anyhow::bail!("SendA2a must be handled in main.rs (requires async runtime)")
-        }
-        crate::ChannelCommands::RemoveA2aPeer { .. } => {
-            anyhow::bail!("RemoveA2aPeer must be handled in main.rs (requires async runtime)")
-        }
     }
 }
 
