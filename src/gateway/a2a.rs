@@ -788,7 +788,7 @@ pub async fn handle_a2a_pair_confirm(
 
 /// Generate a cryptographically secure bearer token for A2A authentication.
 fn generate_bearer_token() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     format!("a2a_{}", hex::encode(bytes))

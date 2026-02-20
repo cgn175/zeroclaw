@@ -313,7 +313,7 @@ pub fn is_tls_required(endpoint: &str) -> bool {
 ///
 /// Uses 256 bits of entropy from the OS CSPRNG.
 fn generate_bearer_token() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     format!("a2a_{}", hex::encode(bytes))
