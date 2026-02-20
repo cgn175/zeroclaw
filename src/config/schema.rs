@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
-use tokio::fs::{self, OpenOptions};
 #[cfg(unix)]
 use tokio::fs::File;
+use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
 const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
@@ -2197,6 +2197,8 @@ pub struct ChannelsConfig {
     pub dingtalk: Option<DingTalkConfig>,
     /// QQ Official Bot channel configuration.
     pub qq: Option<QQConfig>,
+    /// A2A (Agent-to-Agent) channel configuration.
+    pub a2a: Option<A2AConfig>,
     /// Timeout in seconds for processing a single channel message (LLM + tools).
     /// Default: 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
     #[serde(default = "default_channel_message_timeout_secs")]
@@ -2226,6 +2228,7 @@ impl Default for ChannelsConfig {
             lark: None,
             dingtalk: None,
             qq: None,
+            a2a: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
         }
     }
@@ -2708,6 +2711,180 @@ pub struct QQConfig {
     /// Allowed user IDs. Empty = deny all, "*" = allow all
     #[serde(default)]
     pub allowed_users: Vec<String>,
+}
+
+/// A2A rate limit configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct A2ARateLimitConfig {
+    /// Requests per minute per peer. Default: 60 (1 req/sec average).
+    #[serde(default = "default_a2a_requests_per_minute")]
+    pub requests_per_minute: u32,
+    /// Burst size - max concurrent requests allowed. Default: 10.
+    #[serde(default = "default_a2a_burst_size")]
+    pub burst_size: u32,
+}
+
+impl Default for A2ARateLimitConfig {
+    fn default() -> Self {
+        Self {
+            requests_per_minute: default_a2a_requests_per_minute(),
+            burst_size: default_a2a_burst_size(),
+        }
+    }
+}
+
+fn default_a2a_requests_per_minute() -> u32 {
+    60
+}
+
+fn default_a2a_burst_size() -> u32 {
+    10
+}
+
+/// A2A idempotency configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct A2AIdempotencyConfig {
+    /// TTL for idempotency entries in seconds. Default: 86400 (24 hours).
+    #[serde(default = "default_a2a_idempotency_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Maximum number of idempotency keys to track. Default: 10000.
+    #[serde(default = "default_a2a_idempotency_max_keys")]
+    pub max_keys: usize,
+}
+
+impl Default for A2AIdempotencyConfig {
+    fn default() -> Self {
+        Self {
+            ttl_secs: default_a2a_idempotency_ttl_secs(),
+            max_keys: default_a2a_idempotency_max_keys(),
+        }
+    }
+}
+
+fn default_a2a_idempotency_ttl_secs() -> u64 {
+    86400
+}
+
+fn default_a2a_idempotency_max_keys() -> usize {
+    10000
+}
+
+/// A2A (Agent-to-Agent) channel configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct A2AConfig {
+    /// Enable A2A channel. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Dedicated A2A listen port. Default: 9000.
+    #[serde(default = "default_a2a_port")]
+    pub listen_port: u16,
+    /// Discovery mode: "static" only for v1. Default: "static".
+    #[serde(default = "default_a2a_discovery")]
+    pub discovery_mode: String,
+    /// Allowed peer IDs. Default: ["*"] allows all.
+    #[serde(default = "default_a2a_allowed_peers")]
+    pub allowed_peer_ids: Vec<String>,
+    /// Configured A2A peers.
+    #[serde(default)]
+    pub peers: Vec<A2APeerConfig>,
+    /// Reconnection configuration for SSE connections.
+    #[serde(default)]
+    pub reconnect: A2AReconnectConfig,
+    /// Rate limiting configuration.
+    #[serde(default)]
+    pub rate_limit: A2ARateLimitConfig,
+    /// Idempotency configuration.
+    #[serde(default)]
+    pub idempotency: A2AIdempotencyConfig,
+}
+
+/// A2A reconnection configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct A2AReconnectConfig {
+    /// Initial retry delay in seconds. Default: 2.
+    #[serde(default = "default_a2a_reconnect_initial_delay")]
+    pub initial_delay_secs: u64,
+    /// Maximum retry delay in seconds. Default: 60.
+    #[serde(default = "default_a2a_reconnect_max_delay")]
+    pub max_delay_secs: u64,
+    /// Maximum number of retries before marking peer as Failed. Default: 10.
+    #[serde(default = "default_a2a_reconnect_max_retries")]
+    pub max_retries: u32,
+    /// Health check recovery interval in seconds. Default: 30.
+    #[serde(default = "default_a2a_health_check_interval")]
+    pub health_check_interval_secs: u64,
+}
+
+impl Default for A2AReconnectConfig {
+    fn default() -> Self {
+        Self {
+            initial_delay_secs: default_a2a_reconnect_initial_delay(),
+            max_delay_secs: default_a2a_reconnect_max_delay(),
+            max_retries: default_a2a_reconnect_max_retries(),
+            health_check_interval_secs: default_a2a_health_check_interval(),
+        }
+    }
+}
+
+fn default_a2a_reconnect_initial_delay() -> u64 {
+    2
+}
+
+fn default_a2a_reconnect_max_delay() -> u64 {
+    60
+}
+
+fn default_a2a_reconnect_max_retries() -> u32 {
+    10
+}
+
+fn default_a2a_health_check_interval() -> u64 {
+    30
+}
+
+/// A2A peer configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct A2APeerConfig {
+    /// Unique peer identifier.
+    pub id: String,
+    /// Peer endpoint URL (https://host:port).
+    pub endpoint: String,
+    /// Bearer token for authentication (encrypted).
+    pub bearer_token: String,
+    /// Whether this peer is enabled.
+    #[serde(default = "default_peer_enabled")]
+    pub enabled: bool,
+}
+
+fn default_a2a_port() -> u16 {
+    9000
+}
+
+fn default_a2a_discovery() -> String {
+    "static".to_string()
+}
+
+fn default_a2a_allowed_peers() -> Vec<String> {
+    vec!["*".to_string()]
+}
+
+fn default_peer_enabled() -> bool {
+    true
+}
+
+impl Default for A2AConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_port: default_a2a_port(),
+            discovery_mode: default_a2a_discovery(),
+            allowed_peer_ids: default_a2a_allowed_peers(),
+            peers: Vec::new(),
+            reconnect: A2AReconnectConfig::default(),
+            rate_limit: A2ARateLimitConfig::default(),
+            idempotency: A2AIdempotencyConfig::default(),
+        }
+    }
 }
 
 // ── Config impl ──────────────────────────────────────────────────
@@ -3544,9 +3721,9 @@ async fn sync_directory(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     #[cfg(unix)]
     use std::{fs::Permissions, os::unix::fs::PermissionsExt};
-    use std::path::PathBuf;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
     use tokio_stream::wrappers::ReadDirStream;
@@ -3764,6 +3941,7 @@ default_temperature = 0.7
                 lark: None,
                 dingtalk: None,
                 qq: None,
+                a2a: None,
                 message_timeout_secs: 300,
             },
             memory: MemoryConfig::default(),
@@ -4290,6 +4468,7 @@ allowed_users = ["@ops:matrix.org"]
             lark: None,
             dingtalk: None,
             qq: None,
+            a2a: None,
             message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
@@ -4467,6 +4646,7 @@ channel_id = "C123"
             lark: None,
             dingtalk: None,
             qq: None,
+            a2a: None,
             message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();

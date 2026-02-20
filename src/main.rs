@@ -36,6 +36,7 @@ use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use dialoguer::{Input, Password};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -590,6 +591,89 @@ enum ChannelCommands {
         /// Telegram identity to allow (username without '@' or numeric user ID)
         identity: String,
     },
+    /// Pair with an A2A (Agent-to-Agent) peer
+    #[command(long_about = "\
+Initiate pairing with an A2A peer agent.
+
+This command starts the pairing flow to establish secure communication
+with another ZeroClaw agent. The pairing code will be displayed and
+must be provided to the peer operator for confirmation.
+
+The peer endpoint must use HTTPS (except localhost for testing).
+
+Examples:
+  zeroclaw channel pair-a2a https://peer.example.com:9000")]
+    PairA2a {
+        /// Peer endpoint URL (https://host:port)
+        peer_endpoint: String,
+        /// Our peer ID (defaults to hostname)
+        #[arg(long)]
+        our_peer_id: Option<String>,
+    },
+    /// Complete A2A pairing by exchanging the pairing code for a bearer token
+    #[command(long_about = "\
+Complete A2A pairing by exchanging the pairing code for a bearer token.
+
+This command exchanges the pairing code (received from the peer) for
+a bearer token that will be used for authenticated communication.
+
+Examples:
+  zeroclaw channel confirm-a2a https://peer.example.com:9000 123456")]
+    ConfirmA2a {
+        /// Peer endpoint URL (https://host:port)
+        peer_endpoint: String,
+        /// The pairing code received from the peer
+        pairing_code: String,
+    },
+    /// List configured A2A peers
+    #[command(long_about = "\
+List all configured A2A peers.
+
+Displays a table of peers with their IDs, endpoints, enabled status,
+and connection status (if available).
+
+Examples:
+  zeroclaw channel list-a2a-peers")]
+    ListA2aPeers,
+    /// Test connectivity to an A2A peer
+    #[command(long_about = "\
+Test connectivity to a configured A2A peer.
+
+Sends a health check request to the peer and displays the result.
+
+Examples:
+  zeroclaw channel test-a2a-peer peer_abc123")]
+    TestA2aPeer {
+        /// Peer ID to test
+        peer_id: String,
+    },
+    /// Send a test message to an A2A peer
+    #[command(long_about = "\
+Send a test message to a configured A2A peer.
+
+Constructs an A2A message and POSTs it to the peer's /a2a/send endpoint.
+
+Examples:
+  zeroclaw channel send-a2a peer_abc123 \"Hello from ZeroClaw!\"")]
+    SendA2a {
+        /// Peer ID to send to
+        peer_id: String,
+        /// Message content
+        message: String,
+    },
+    /// Remove an A2A peer from configuration
+    #[command(long_about = "\
+Remove an A2A peer from the configuration.
+
+This removes the peer from the config file. The peer will no longer
+be able to communicate with this agent.
+
+Examples:
+  zeroclaw channel remove-a2a-peer peer_abc123")]
+    RemoveA2aPeer {
+        /// Peer ID to remove
+        peer_id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -875,6 +959,96 @@ async fn main() -> Result<()> {
         Commands::Channel { channel_command } => match channel_command {
             ChannelCommands::Start => channels::start_channels(config).await,
             ChannelCommands::Doctor => channels::doctor_channels(config).await,
+            ChannelCommands::PairA2a {
+                peer_endpoint,
+                our_peer_id,
+            } => {
+                let our_peer_id = our_peer_id.unwrap_or_else(|| {
+                    hostname::get()
+                        .ok()
+                        .and_then(|h| h.into_string().ok())
+                        .unwrap_or_else(|| "zeroclaw-agent".to_string())
+                });
+
+                let secret_store = crate::security::secrets::SecretStore::new(
+                    config.config_path.parent().unwrap_or(&config.workspace_dir),
+                    config.secrets.encrypt,
+                );
+
+                match crate::channels::a2a::pairing::initiate_peer_pairing(
+                    &peer_endpoint,
+                    &our_peer_id,
+                    &secret_store,
+                )
+                .await
+                {
+                    Ok((peer_id, token)) => {
+                        println!("✅ Successfully paired with peer: {}", peer_id);
+                        println!("🔐 Bearer token saved (encrypted)");
+                        println!("   Token preview: {}...", &token[..8.min(token.len())]);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        // The initiate function returns an error with instructions
+                        // when waiting for operator confirmation
+                        println!("{}", e);
+                        Ok(())
+                    }
+                }
+            }
+            ChannelCommands::ConfirmA2a {
+                peer_endpoint,
+                pairing_code,
+            } => {
+                let secret_store = crate::security::secrets::SecretStore::new(
+                    config.config_path.parent().unwrap_or(&config.workspace_dir),
+                    config.secrets.encrypt,
+                );
+
+                match crate::channels::a2a::pairing::complete_pairing(
+                    &peer_endpoint,
+                    &pairing_code,
+                    &secret_store,
+                )
+                .await
+                {
+                    Ok((peer_id, encrypted_token)) => {
+                        println!("✅ Successfully completed pairing with peer: {}", peer_id);
+                        println!("🔐 Bearer token saved (encrypted)");
+                        println!(
+                            "   Encrypted token preview: {}...",
+                            &encrypted_token[..16.min(encrypted_token.len())]
+                        );
+
+                        // TODO: Add peer to config
+                        println!("💡 Add this peer to your config:");
+                        println!(
+                            r#"[[channels_config.a2a.peers]]
+id = "{}"
+endpoint = "{}"
+bearer_token = "{}"
+enabled = true"#,
+                            peer_id, peer_endpoint, encrypted_token
+                        );
+
+                        Ok(())
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Pairing confirmation failed: {}", e);
+                        Err(e)
+                    }
+                }
+            }
+            ChannelCommands::ListA2aPeers => handle_list_a2a_peers(&config).await,
+            ChannelCommands::TestA2aPeer { peer_id } => {
+                handle_test_a2a_peer(&config, &peer_id).await
+            }
+            ChannelCommands::SendA2a { peer_id, message } => {
+                handle_send_a2a(&config, &peer_id, &message).await
+            }
+            ChannelCommands::RemoveA2aPeer { peer_id } => {
+                handle_remove_a2a_peer(&mut config, &peer_id).await
+            }
             other => channels::handle_command(other, &config).await,
         },
 
@@ -1344,6 +1518,208 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
             Ok(())
         }
+    }
+}
+
+/// List configured A2A peers
+async fn handle_list_a2a_peers(config: &Config) -> Result<()> {
+    let a2a_config = match &config.channels_config.a2a {
+        Some(cfg) => cfg,
+        None => {
+            println!("A2A channel is not configured.");
+            println!("Run `zeroclaw onboard` to configure A2A.");
+            return Ok(());
+        }
+    };
+
+    if a2a_config.peers.is_empty() {
+        println!("No A2A peers configured.");
+        println!("Use `zeroclaw channel pair-a2a <endpoint>` to add a peer.");
+        return Ok(());
+    }
+
+    println!("Configured A2A peers:");
+    println!();
+    println!(
+        "  {:<20} {:<30} {:<10} {:<15}",
+        "ID", "Endpoint", "Enabled", "Status"
+    );
+    println!("  {}", "─".repeat(80));
+
+    for peer in &a2a_config.peers {
+        let status = if peer.enabled { "unknown" } else { "disabled" };
+        let enabled_str = if peer.enabled { "✅ yes" } else { "❌ no" };
+        println!(
+            "  {:<20} {:<30} {:<10} {:<15}",
+            truncate_str(&peer.id, 20),
+            truncate_str(&peer.endpoint, 30),
+            enabled_str,
+            status
+        );
+    }
+
+    println!();
+    println!("Total peers: {}", a2a_config.peers.len());
+    Ok(())
+}
+
+/// Test connectivity to an A2A peer
+async fn handle_test_a2a_peer(config: &Config, peer_id: &str) -> Result<()> {
+    let a2a_config = match &config.channels_config.a2a {
+        Some(cfg) => cfg,
+        None => {
+            bail!("A2A channel is not configured");
+        }
+    };
+
+    let peer = a2a_config
+        .peers
+        .iter()
+        .find(|p| p.id == peer_id)
+        .ok_or_else(|| anyhow::anyhow!("Peer '{}' not found in configuration", peer_id))?;
+
+    if !peer.enabled {
+        println!("⚠️  Peer '{}' is disabled in configuration", peer_id);
+    }
+
+    println!(
+        "Testing connectivity to peer '{}' at {}...",
+        peer_id, peer.endpoint
+    );
+
+    // Create HTTP client
+    let client = reqwest::Client::new();
+
+    // Send health check request
+    let health_url = format!("{}/health", peer.endpoint.trim_end_matches('/'));
+
+    match client
+        .get(&health_url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(response) => {
+            let status = response.status();
+            if status.is_success() {
+                println!("✅ Peer '{}' is reachable (HTTP {})", peer_id, status);
+                Ok(())
+            } else {
+                bail!("Peer '{}' returned HTTP {}", peer_id, status);
+            }
+        }
+        Err(e) => {
+            bail!("Failed to reach peer '{}': {}", peer_id, e);
+        }
+    }
+}
+
+/// Send a test message to an A2A peer
+async fn handle_send_a2a(config: &Config, peer_id: &str, message: &str) -> Result<()> {
+    use zeroclaw::channels::a2a::A2AMessage;
+
+    let a2a_config = match &config.channels_config.a2a {
+        Some(cfg) => cfg,
+        None => {
+            bail!("A2A channel is not configured");
+        }
+    };
+
+    let peer = a2a_config
+        .peers
+        .iter()
+        .find(|p| p.id == peer_id)
+        .ok_or_else(|| anyhow::anyhow!("Peer '{}' not found in configuration", peer_id))?;
+
+    if !peer.enabled {
+        bail!("Peer '{}' is disabled in configuration", peer_id);
+    }
+
+    // Get our peer ID from config or hostname
+    let our_peer_id = hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "zeroclaw-agent".to_string());
+
+    // Create the message
+    let a2a_message = A2AMessage::new(
+        format!(
+            "cli-session-{}",
+            uuid::Uuid::new_v4()
+                .to_string()
+                .split('-')
+                .next()
+                .unwrap_or("unknown")
+        ),
+        &our_peer_id,
+        peer_id,
+        message,
+    );
+
+    println!("Sending message to peer '{}'...", peer_id);
+
+    // Create HTTP client
+    let client = reqwest::Client::new();
+
+    // Send the message
+    let send_url = format!("{}/a2a/send", peer.endpoint.trim_end_matches('/'));
+
+    match client
+        .post(&send_url)
+        .header("Authorization", format!("Bearer {}", peer.bearer_token))
+        .json(&a2a_message)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+    {
+        Ok(response) => {
+            let status = response.status();
+            if status.is_success() {
+                println!("✅ Message sent successfully to peer '{}'", peer_id);
+                println!("   Message ID: {}", a2a_message.id);
+                Ok(())
+            } else {
+                let body = response.text().await.unwrap_or_default();
+                bail!("Failed to send message: HTTP {} - {}", status, body);
+            }
+        }
+        Err(e) => {
+            bail!("Failed to send message to peer '{}': {}", peer_id, e);
+        }
+    }
+}
+
+/// Remove an A2A peer from configuration
+async fn handle_remove_a2a_peer(config: &mut Config, peer_id: &str) -> Result<()> {
+    let a2a_config = match config.channels_config.a2a.as_mut() {
+        Some(cfg) => cfg,
+        None => {
+            bail!("A2A channel is not configured");
+        }
+    };
+
+    let initial_count = a2a_config.peers.len();
+
+    // Remove the peer
+    a2a_config.peers.retain(|p| p.id != peer_id);
+
+    if a2a_config.peers.len() == initial_count {
+        bail!("Peer '{}' not found in configuration", peer_id);
+    }
+
+    // Save the config
+    config.save().await?;
+
+    println!("✅ Removed peer '{}' from configuration", peer_id);
+    Ok(())
+}
+
+/// Truncate a string to a maximum length, adding ellipsis if truncated
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len.saturating_sub(3)])
     }
 }
 

@@ -133,6 +133,89 @@ Examples:
         /// Telegram identity to allow (username without '@' or numeric user ID)
         identity: String,
     },
+    /// Pair with an A2A (Agent-to-Agent) peer
+    #[command(long_about = "\
+Initiate pairing with an A2A peer agent.
+
+This command starts the pairing flow to establish secure communication
+with another ZeroClaw agent. The pairing code will be displayed and
+must be provided to the peer operator for confirmation.
+
+The peer endpoint must use HTTPS (except localhost for testing).
+
+Examples:
+  zeroclaw channel pair-a2a https://peer.example.com:9000")]
+    PairA2a {
+        /// Peer endpoint URL (https://host:port)
+        peer_endpoint: String,
+        /// Our peer ID (defaults to hostname)
+        #[arg(long)]
+        our_peer_id: Option<String>,
+    },
+    /// Complete A2A pairing by exchanging the pairing code for a bearer token
+    #[command(long_about = "\
+Complete A2A pairing by exchanging the pairing code for a bearer token.
+
+This command exchanges the pairing code (received from the peer) for
+a bearer token that will be used for authenticated communication.
+
+Examples:
+  zeroclaw channel confirm-a2a https://peer.example.com:9000 123456")]
+    ConfirmA2a {
+        /// Peer endpoint URL (https://host:port)
+        peer_endpoint: String,
+        /// The pairing code received from the peer
+        pairing_code: String,
+    },
+    /// List configured A2A peers
+    #[command(long_about = "\
+List all configured A2A peers.
+
+Displays a table of peers with their IDs, endpoints, enabled status,
+and connection status (if available).
+
+Examples:
+  zeroclaw channel list-a2a-peers")]
+    ListA2aPeers,
+    /// Test connectivity to an A2A peer
+    #[command(long_about = "\
+Test connectivity to a configured A2A peer.
+
+Sends a health check request to the peer and displays the result.
+
+Examples:
+  zeroclaw channel test-a2a-peer peer_abc123")]
+    TestA2aPeer {
+        /// Peer ID to test
+        peer_id: String,
+    },
+    /// Send a test message to an A2A peer
+    #[command(long_about = "\
+Send a test message to a configured A2A peer.
+
+Constructs an A2A message and POSTs it to the peer's /a2a/send endpoint.
+
+Examples:
+  zeroclaw channel send-a2a peer_abc123 \"Hello from ZeroClaw!\"")]
+    SendA2a {
+        /// Peer ID to send to
+        peer_id: String,
+        /// Message content
+        message: String,
+    },
+    /// Remove an A2A peer from configuration
+    #[command(long_about = "\
+Remove an A2A peer from the configuration.
+
+This removes the peer from the config file. The peer will no longer
+be able to communicate with this agent.
+
+Examples:
+  zeroclaw channel remove-a2a-peer peer_abc123")]
+    RemoveA2aPeer {
+        /// Peer ID to remove
+        peer_id: String,
+    },
 }
 
 /// Skills management subcommands

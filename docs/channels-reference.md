@@ -109,6 +109,7 @@ If `[channels_config.matrix]` is present but the binary was built without `chann
 | DingTalk | stream mode | No |
 | QQ | bot gateway | No |
 | iMessage | local integration | No |
+| A2A | HTTP/2 + SSE | Yes (if receiving from external peers) |
 
 ---
 
@@ -127,6 +128,7 @@ Field names differ by channel:
 - `allowed_numbers` (WhatsApp)
 - `allowed_senders` (Email)
 - `allowed_contacts` (iMessage)
+- `allowed_peer_ids` (A2A)
 
 ---
 
@@ -314,6 +316,41 @@ allowed_users = ["*"]
 allowed_contacts = ["*"]
 ```
 
+### 4.15 A2A (Agent-to-Agent)
+
+The A2A channel enables direct communication between ZeroClaw agents over HTTP/2 without third-party services.
+
+```toml
+[channels_config.a2a]
+enabled = true
+listen_port = 9000
+discovery_mode = "static"
+allowed_peer_ids = ["*"]
+
+[[channels_config.a2a.peers]]
+id = "agent-alpha"
+endpoint = "https://192.168.1.100:9000"
+bearer_token = "encrypted:..."
+enabled = true
+
+[channels_config.a2a.rate_limit]
+requests_per_minute = 60
+burst_size = 10
+
+[channels_config.a2a.reconnect]
+initial_delay_secs = 2
+max_delay_secs = 60
+max_retries = 10
+```
+
+A2A notes:
+
+- Uses HTTP/2 + SSE for bidirectional streaming
+- Bearer tokens are exchanged via pairing flow (`zeroclaw channel pair-a2a`)
+- Reconnection uses exponential backoff (2s, 4s, 8s... up to 60s)
+- TLS is enforced for all non-localhost endpoints
+- See [A2A Setup Guide](./a2a-setup.md) for detailed configuration
+
 ---
 
 ## 5. Validation Workflow
@@ -362,7 +399,7 @@ RUST_LOG=info zeroclaw daemon 2>&1 | tee /tmp/zeroclaw.log
 Then filter channel/gateway events:
 
 ```bash
-rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|DingTalk|QQ|iMessage|Webhook|Channel" /tmp/zeroclaw.log
+rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|DingTalk|QQ|iMessage|A2A|Webhook|Channel" /tmp/zeroclaw.log
 ```
 
 ### 7.2 Keyword table
@@ -383,6 +420,7 @@ rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|D
 | DingTalk | `DingTalk: connected and listening for messages...` | `DingTalk: ignoring message from unauthorized user:` | `DingTalk WebSocket error:` / `DingTalk: message channel closed` |
 | QQ | `QQ: connected and identified` | `QQ: ignoring C2C message from unauthorized user:` / `QQ: ignoring group message from unauthorized user:` | `QQ: received Reconnect (op 7)` / `QQ: received Invalid Session (op 9)` / `QQ: message channel closed` |
 | iMessage | `iMessage channel listening (AppleScript bridge)...` | (contact allowlist enforced by `allowed_contacts`) | `iMessage poll error:` |
+| A2A | `A2A channel listening on port` / `A2A: connected to peer` | `A2A: rejected message from unauthorized peer` / `A2A: invalid bearer token` | `A2A: connection error` / `A2A: reconnecting to peer` / `A2A: SSE stream closed` |
 
 ### 7.3 Runtime supervisor keywords
 

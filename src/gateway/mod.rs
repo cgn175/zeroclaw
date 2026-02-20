@@ -7,6 +7,8 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+pub mod a2a;
+
 use crate::channels::{Channel, LinqChannel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -283,6 +285,12 @@ pub struct AppState {
     pub linq_signing_secret: Option<Arc<str>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn crate::observability::Observer>,
+    /// A2A-specific rate limiter (per-peer)
+    pub a2a_rate_limiter: Option<Arc<a2a::A2ARateLimiter>>,
+    /// A2A-specific idempotency store (message ID tracking)
+    pub a2a_idempotency_store: Option<Arc<a2a::A2AIdempotencyStore>>,
+    /// A2A pairing manager for peer authentication
+    pub a2a_pairing_manager: Option<Arc<crate::channels::a2a::pairing::PairingManager>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -452,6 +460,30 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         idempotency_max_keys,
     ));
 
+    // ── A2A rate limiter, idempotency store, and pairing manager ────────────────
+    let (a2a_rate_limiter, a2a_idempotency_store, a2a_pairing_manager) = config
+        .channels_config
+        .a2a
+        .as_ref()
+        .filter(|cfg| cfg.enabled)
+        .map(|cfg| {
+            let rate_limiter = Arc::new(a2a::A2ARateLimiter::new(
+                cfg.rate_limit.requests_per_minute,
+                cfg.rate_limit.burst_size as usize,
+            ));
+            let idempotency_store = Arc::new(a2a::A2AIdempotencyStore::new(
+                Duration::from_secs(cfg.idempotency.ttl_secs.max(1)),
+                cfg.idempotency.max_keys,
+            ));
+            let pairing_manager = Arc::new(crate::channels::a2a::pairing::PairingManager::new());
+            (
+                Some(rate_limiter),
+                Some(idempotency_store),
+                Some(pairing_manager),
+            )
+        })
+        .unwrap_or((None, None, None));
+
     // ── Tunnel ────────────────────────────────────────────────
     let tunnel = crate::tunnel::create_tunnel(&config.tunnel)?;
     let mut tunnel_url: Option<String> = None;
@@ -483,6 +515,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     if linq_channel.is_some() {
         println!("  POST /linq      — Linq message webhook (iMessage/RCS/SMS)");
     }
+    // A2A endpoints (always shown since they depend on runtime config)
+    println!("  POST /a2a/send  — A2A message receive (bearer auth)");
+    println!("  GET  /a2a/stream/:session_id — A2A SSE response stream");
+    println!("  GET  /a2a/health — A2A health check (public)");
+    println!("  POST /a2a/pair/request — Request A2A pairing code");
+    println!("  POST /a2a/pair/confirm — Confirm A2A pairing");
     println!("  GET  /health    — health check");
     println!("  GET  /metrics   — Prometheus metrics");
     if let Some(code) = pairing.pairing_code() {
@@ -522,6 +560,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         linq: linq_channel,
         linq_signing_secret,
         observer,
+        a2a_rate_limiter,
+        a2a_idempotency_store,
+        a2a_pairing_manager,
     };
 
     // Build router with middleware
@@ -533,6 +574,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/linq", post(handle_linq_webhook))
+        // A2A (Agent-to-Agent) protocol endpoints
+        .route("/a2a/send", post(a2a::handle_a2a_send))
+        .route("/a2a/stream/{session_id}", get(a2a::handle_a2a_stream))
+        .route("/a2a/health", get(a2a::handle_a2a_health))
+        .route("/a2a/pair/request", post(a2a::handle_a2a_pair_request))
+        .route("/a2a/pair/confirm", post(a2a::handle_a2a_pair_confirm))
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -1256,6 +1303,9 @@ mod tests {
             linq: None,
             linq_signing_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            a2a_rate_limiter: None,
+            a2a_idempotency_store: None,
+            a2a_pairing_manager: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1299,6 +1349,9 @@ mod tests {
             linq: None,
             linq_signing_secret: None,
             observer,
+            a2a_rate_limiter: None,
+            a2a_idempotency_store: None,
+            a2a_pairing_manager: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1659,6 +1712,9 @@ mod tests {
             linq: None,
             linq_signing_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            a2a_rate_limiter: None,
+            a2a_idempotency_store: None,
+            a2a_pairing_manager: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1717,6 +1773,9 @@ mod tests {
             linq: None,
             linq_signing_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            a2a_rate_limiter: None,
+            a2a_idempotency_store: None,
+            a2a_pairing_manager: None,
         };
 
         let headers = HeaderMap::new();
@@ -1787,6 +1846,9 @@ mod tests {
             linq: None,
             linq_signing_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            a2a_rate_limiter: None,
+            a2a_idempotency_store: None,
+            a2a_pairing_manager: None,
         };
 
         let response = handle_webhook(
@@ -1829,6 +1891,9 @@ mod tests {
             linq: None,
             linq_signing_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            a2a_rate_limiter: None,
+            a2a_idempotency_store: None,
+            a2a_pairing_manager: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1876,6 +1941,9 @@ mod tests {
             linq: None,
             linq_signing_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            a2a_rate_limiter: None,
+            a2a_idempotency_store: None,
+            a2a_pairing_manager: None,
         };
 
         let mut headers = HeaderMap::new();

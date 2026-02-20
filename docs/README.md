@@ -52,6 +52,7 @@ Localized hubs: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · 
 - [providers-reference.md](providers-reference.md) — provider IDs, aliases, credential env vars
 - [channels-reference.md](channels-reference.md) — channel capabilities and setup paths
 - [matrix-e2ee-guide.md](matrix-e2ee-guide.md) — Matrix encrypted-room (E2EE) setup and no-response diagnostics
+- [a2a-setup.md](a2a-setup.md) — Agent-to-Agent (A2A) protocol setup and peer pairing
 - [config-reference.md](config-reference.md) — high-signal config keys and secure defaults
 - [custom-providers.md](custom-providers.md) — custom provider/base URL integration templates
 - [zai-glm-setup.md](zai-glm-setup.md) — Z.AI/GLM setup and endpoint matrix

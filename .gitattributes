@@ -31,3 +31,6 @@ Dockerfile* text eol=lf
 *.dll binary
 *.exe binary
 *.a binary
+
+# Use bd merge for beads JSONL files
+.beads/issues.jsonl merge=beads

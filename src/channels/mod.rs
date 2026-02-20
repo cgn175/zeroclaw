@@ -14,6 +14,7 @@
 //! To add a new channel, implement [`Channel`] in a new submodule and wire it into
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
+pub mod a2a;
 pub mod cli;
 pub mod dingtalk;
 pub mod discord;
@@ -36,6 +37,7 @@ pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
 
+pub use a2a::{A2AChannel, A2AConfig, A2AMessage, A2APeer};
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
 pub use discord::DiscordChannel;
@@ -1578,6 +1580,7 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
                 ("Lark", config.channels_config.lark.is_some()),
                 ("DingTalk", config.channels_config.dingtalk.is_some()),
                 ("QQ", config.channels_config.qq.is_some()),
+                ("A2A", config.channels_config.a2a.is_some()),
             ] {
                 println!("  {} {name}", if configured { "✅" } else { "❌" });
             }
@@ -1604,6 +1607,24 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
         }
         crate::ChannelCommands::BindTelegram { identity } => {
             bind_telegram_identity(config, &identity).await
+        }
+        crate::ChannelCommands::PairA2a { .. } => {
+            anyhow::bail!("PairA2a must be handled in main.rs (requires async runtime)")
+        }
+        crate::ChannelCommands::ConfirmA2a { .. } => {
+            anyhow::bail!("ConfirmA2a must be handled in main.rs (requires async runtime)")
+        }
+        crate::ChannelCommands::ListA2aPeers => {
+            anyhow::bail!("ListA2aPeers must be handled in main.rs (requires async runtime)")
+        }
+        crate::ChannelCommands::TestA2aPeer { .. } => {
+            anyhow::bail!("TestA2aPeer must be handled in main.rs (requires async runtime)")
+        }
+        crate::ChannelCommands::SendA2a { .. } => {
+            anyhow::bail!("SendA2a must be handled in main.rs (requires async runtime)")
+        }
+        crate::ChannelCommands::RemoveA2aPeer { .. } => {
+            anyhow::bail!("RemoveA2aPeer must be handled in main.rs (requires async runtime)")
         }
     }
 }
@@ -2172,6 +2193,44 @@ pub async fn start_channels(config: Config) -> Result<()> {
             qq.app_secret.clone(),
             qq.allowed_users.clone(),
         )));
+    }
+
+    // A2A (Agent-to-Agent) channel
+    if let Some(ref a2a) = config.channels_config.a2a {
+        if a2a.enabled {
+            let enabled_peer_count = a2a.peers.iter().filter(|p| p.enabled).count();
+            if enabled_peer_count > 0 {
+                // Convert config schema types to protocol types
+                let protocol_peers: Vec<crate::channels::a2a::protocol::A2APeer> = a2a
+                    .peers
+                    .iter()
+                    .map(|p| crate::channels::a2a::protocol::A2APeer {
+                        id: p.id.clone(),
+                        endpoint: p.endpoint.clone(),
+                        bearer_token: p.bearer_token.clone(),
+                        enabled: p.enabled,
+                    })
+                    .collect();
+
+                let a2a_protocol_config = crate::channels::a2a::protocol::A2AConfig {
+                    enabled: a2a.enabled,
+                    listen_port: a2a.listen_port,
+                    discovery_mode: a2a.discovery_mode.clone(),
+                    allowed_peer_ids: a2a.allowed_peer_ids.clone(),
+                    peers: protocol_peers,
+                    rate_limit: crate::channels::a2a::protocol::A2ARateLimitConfig::default(),
+                    idempotency: crate::channels::a2a::protocol::A2AIdempotencyConfig::default(),
+                };
+
+                channels.push(Arc::new(A2AChannel::new(a2a_protocol_config)));
+                tracing::info!(
+                    "A2A channel registered with {} enabled peer(s)",
+                    enabled_peer_count
+                );
+            } else {
+                tracing::warn!("A2A channel enabled but no peers configured or all peers disabled");
+            }
+        }
     }
 
     if channels.is_empty() {
