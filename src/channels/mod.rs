@@ -1970,12 +1970,6 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
         crate::ChannelCommands::BindTelegram { identity } => {
             bind_telegram_identity(config, &identity).await
         }
-        crate::ChannelCommands::PairA2a { .. } => {
-            anyhow::bail!("PairA2a must be handled in main.rs (requires async runtime)")
-        }
-        crate::ChannelCommands::ConfirmA2a { .. } => {
-            anyhow::bail!("ConfirmA2a must be handled in main.rs (requires async runtime)")
-        }
         crate::ChannelCommands::ListA2aPeers => {
             anyhow::bail!("ListA2aPeers must be handled in main.rs (requires async runtime)")
         }

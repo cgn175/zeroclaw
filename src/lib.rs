@@ -135,40 +135,6 @@ Examples:
         /// Telegram identity to allow (username without '@' or numeric user ID)
         identity: String,
     },
-    /// Pair with an A2A (Agent-to-Agent) peer
-    #[command(long_about = "\
-Initiate pairing with an A2A peer agent.
-
-This command starts the pairing flow to establish secure communication
-with another ZeroClaw agent. The pairing code will be displayed and
-must be provided to the peer operator for confirmation.
-
-The peer endpoint must use HTTPS (except localhost for testing).
-
-Examples:
-  zeroclaw channel pair-a2a https://peer.example.com:9000")]
-    PairA2a {
-        /// Peer endpoint URL (https://host:port)
-        peer_endpoint: String,
-        /// Our peer ID (defaults to hostname)
-        #[arg(long)]
-        our_peer_id: Option<String>,
-    },
-    /// Complete A2A pairing by exchanging the pairing code for a bearer token
-    #[command(long_about = "\
-Complete A2A pairing by exchanging the pairing code for a bearer token.
-
-This command exchanges the pairing code (received from the peer) for
-a bearer token that will be used for authenticated communication.
-
-Examples:
-  zeroclaw channel confirm-a2a https://peer.example.com:9000 123456")]
-    ConfirmA2a {
-        /// Peer endpoint URL (https://host:port)
-        peer_endpoint: String,
-        /// The pairing code received from the peer
-        pairing_code: String,
-    },
     /// List configured A2A peers
     #[command(long_about = "\
 List all configured A2A peers.

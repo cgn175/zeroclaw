@@ -285,8 +285,6 @@ pub struct AppState {
     pub linq_signing_secret: Option<Arc<str>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn crate::observability::Observer>,
-    /// A2A pairing manager for peer authentication
-    pub a2a_pairing_manager: Option<Arc<crate::channels::a2a::pairing::PairingManager>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -456,14 +454,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         idempotency_max_keys,
     ));
 
-    // ── A2A rate limiter, idempotency store, and pairing manager ────────────────
-    let a2a_pairing_manager = config
-        .channels_config
-        .a2a
-        .as_ref()
-        .filter(|cfg| cfg.enabled)
-        .map(|_cfg| Arc::new(crate::channels::a2a::pairing::PairingManager::new()));
-
     // ── Tunnel ────────────────────────────────────────────────
     let tunnel = crate::tunnel::create_tunnel(&config.tunnel)?;
     let mut tunnel_url: Option<String> = None;
@@ -540,7 +530,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         linq: linq_channel,
         linq_signing_secret,
         observer,
-        a2a_pairing_manager,
     };
 
     // Build router with middleware
