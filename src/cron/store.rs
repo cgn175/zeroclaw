@@ -5,11 +5,19 @@ use crate::cron::{
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use rusqlite::types::{FromSqlResult, ValueRef};
 use rusqlite::{params, Connection};
 use uuid::Uuid;
 
 const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
 const TRUNCATED_OUTPUT_MARKER: &str = "\n...[truncated]";
+
+impl rusqlite::types::FromSql for JobType {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let text = value.as_str()?;
+        JobType::try_from(text).map_err(|e| rusqlite::types::FromSqlError::Other(e.into()))
+    }
+}
 
 pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJob> {
     let schedule = Schedule::Cron {
@@ -32,12 +40,14 @@ pub fn add_shell_job(
     let expression = schedule_cron_expression(&schedule).unwrap_or_default();
     let schedule_json = serde_json::to_string(&schedule)?;
 
+    let delete_after_run = matches!(schedule, Schedule::At { .. });
+
     with_connection(config, |conn| {
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
                 enabled, delivery, delete_after_run, created_at, next_run
-             ) VALUES (?1, ?2, ?3, ?4, 'shell', NULL, ?5, 'isolated', NULL, 1, ?6, 0, ?7, ?8)",
+             ) VALUES (?1, ?2, ?3, ?4, 'shell', NULL, ?5, 'isolated', NULL, 1, ?6, ?7, ?8, ?9)",
             params![
                 id,
                 expression,
@@ -45,6 +55,7 @@ pub fn add_shell_job(
                 schedule_json,
                 name,
                 serde_json::to_string(&DeliveryConfig::default())?,
+                if delete_after_run { 1 } else { 0 },
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
             ],
@@ -224,7 +235,7 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
                 job.expression,
                 job.command,
                 serde_json::to_string(&job.schedule)?,
-                job.job_type.as_str(),
+                <JobType as Into<&str>>::into(job.job_type).to_string(),
                 job.prompt,
                 job.name,
                 job.session_target.as_str(),
@@ -423,7 +434,7 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         expression,
         schedule,
         command: row.get(2)?,
-        job_type: JobType::parse(&row.get::<_, String>(4)?),
+        job_type: row.get(4)?,
         prompt: row.get(5)?,
         name: row.get(6)?,
         session_target: SessionTarget::parse(&row.get::<_, String>(7)?),
@@ -593,6 +604,32 @@ mod tests {
     }
 
     #[test]
+    fn add_shell_job_marks_at_schedule_for_auto_delete() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let one_shot = add_shell_job(
+            &config,
+            None,
+            Schedule::At {
+                at: Utc::now() + ChronoDuration::minutes(10),
+            },
+            "echo once",
+        )
+        .unwrap();
+        assert!(one_shot.delete_after_run);
+
+        let recurring = add_shell_job(
+            &config,
+            None,
+            Schedule::Every { every_ms: 60_000 },
+            "echo recurring",
+        )
+        .unwrap();
+        assert!(!recurring.delete_after_run);
+    }
+
+    #[test]
     fn add_list_remove_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
@@ -661,6 +698,61 @@ mod tests {
         assert_eq!(stored.last_status.as_deref(), Some("error"));
         assert!(stored.last_run.is_some());
         assert_eq!(stored.last_output.as_deref(), Some("failed output"));
+    }
+
+    #[test]
+    fn job_type_from_sql_reads_valid_value() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let now = Utc::now();
+
+        with_connection(&config, |conn| {
+            conn.execute(
+                "INSERT INTO cron_jobs (id, expression, command, schedule, job_type, created_at, next_run)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    "job-type-valid",
+                    "*/5 * * * *",
+                    "echo ok",
+                    Option::<String>::None,
+                    "agent",
+                    now.to_rfc3339(),
+                    (now + ChronoDuration::minutes(5)).to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let job = get_job(&config, "job-type-valid").unwrap();
+        assert_eq!(job.job_type, JobType::Agent);
+    }
+
+    #[test]
+    fn job_type_from_sql_rejects_invalid_value() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let now = Utc::now();
+
+        with_connection(&config, |conn| {
+            conn.execute(
+                "INSERT INTO cron_jobs (id, expression, command, schedule, job_type, created_at, next_run)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    "job-type-invalid",
+                    "*/5 * * * *",
+                    "echo ok",
+                    Option::<String>::None,
+                    "unknown",
+                    now.to_rfc3339(),
+                    (now + ChronoDuration::minutes(5)).to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(get_job(&config, "job-type-invalid").is_err());
     }
 
     #[test]

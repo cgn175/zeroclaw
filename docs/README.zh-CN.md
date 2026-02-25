@@ -80,6 +80,7 @@
 ## 文档治理与分类
 
 - 统一目录（TOC）：[SUMMARY.md](SUMMARY.md)
+- 文档结构图（按语言/分区/功能）：[structure/README.md](structure/README.md)
 - 文档清单与分类：[docs-inventory.md](docs-inventory.md)
 
 ## 其他语言
@@ -87,3 +88,5 @@
 - English: [README.md](README.md)
 - 日本語: [README.ja.md](README.ja.md)
 - Русский: [README.ru.md](README.ru.md)
+- Français: [README.fr.md](README.fr.md)
+- Tiếng Việt: [i18n/vi/README.md](i18n/vi/README.md)

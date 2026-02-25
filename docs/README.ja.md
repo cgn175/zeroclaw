@@ -80,6 +80,7 @@
 ## ドキュメント運用 / 分類
 
 - 統合 TOC: [SUMMARY.md](SUMMARY.md)
+- ドキュメント構造マップ（言語/カテゴリ/機能）: [structure/README.md](structure/README.md)
 - ドキュメント一覧 / 分類: [docs-inventory.md](docs-inventory.md)
 
 ## 他言語
@@ -87,3 +88,5 @@
 - English: [README.md](README.md)
 - 简体中文: [README.zh-CN.md](README.zh-CN.md)
 - Русский: [README.ru.md](README.ru.md)
+- Français: [README.fr.md](README.fr.md)
+- Tiếng Việt: [i18n/vi/README.md](i18n/vi/README.md)
