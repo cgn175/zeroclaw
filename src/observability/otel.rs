@@ -35,15 +35,13 @@ impl OtelObserver {
     /// Uses HTTP/protobuf transport (port 4318 by default).
     /// Falls back to `http://localhost:4318` if no endpoint is provided.
     pub fn new(endpoint: Option<&str>, service_name: Option<&str>) -> Result<Self, String> {
-        let base_endpoint = endpoint.unwrap_or("http://localhost:4318");
-        let traces_endpoint = format!("{}/v1/traces", base_endpoint.trim_end_matches('/'));
-        let metrics_endpoint = format!("{}/v1/metrics", base_endpoint.trim_end_matches('/'));
+        let endpoint = endpoint.unwrap_or("http://localhost:4318");
         let service_name = service_name.unwrap_or("zeroclaw");
 
         // ── Trace exporter ──────────────────────────────────────
         let span_exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
-            .with_endpoint(&traces_endpoint)
+            .with_endpoint(endpoint)
             .build()
             .map_err(|e| format!("Failed to create OTLP span exporter: {e}"))?;
 
@@ -61,7 +59,7 @@ impl OtelObserver {
         // ── Metric exporter ─────────────────────────────────────
         let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
             .with_http()
-            .with_endpoint(&metrics_endpoint)
+            .with_endpoint(endpoint)
             .build()
             .map_err(|e| format!("Failed to create OTLP metric exporter: {e}"))?;
 
@@ -195,8 +193,6 @@ impl Observer for OtelObserver {
                 duration,
                 success,
                 error_message: _,
-                input_tokens: _,
-                output_tokens: _,
             } => {
                 let secs = duration.as_secs_f64();
                 let attrs = [
@@ -415,8 +411,6 @@ mod tests {
             duration: Duration::from_millis(250),
             success: true,
             error_message: None,
-            input_tokens: Some(100),
-            output_tokens: Some(50),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             provider: "openrouter".into(),
@@ -495,8 +489,6 @@ mod tests {
             duration: Duration::from_millis(0),
             success: false,
             error_message: Some("404 Not Found".into()),
-            input_tokens: None,
-            output_tokens: None,
         });
     }
 

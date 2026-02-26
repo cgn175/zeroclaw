@@ -93,8 +93,6 @@ impl Provider for ScriptedProvider {
             return Ok(ChatResponse {
                 text: Some("done".into()),
                 tool_calls: vec![],
-                usage: None,
-                reasoning_content: None,
             });
         }
         Ok(guard.remove(0))
@@ -330,8 +328,6 @@ fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
     ChatResponse {
         text: Some(String::new()),
         tool_calls: calls,
-        usage: None,
-        reasoning_content: None,
     }
 }
 
@@ -340,8 +336,6 @@ fn text_response(text: &str) -> ChatResponse {
     ChatResponse {
         text: Some(text.into()),
         tool_calls: vec![],
-        usage: None,
-        reasoning_content: None,
     }
 }
 
@@ -352,8 +346,6 @@ fn xml_tool_response(name: &str, args: &str) -> ChatResponse {
             "<tool_call>\n{{\"name\": \"{name}\", \"arguments\": {args}}}\n</tool_call>"
         )),
         tool_calls: vec![],
-        usage: None,
-        reasoning_content: None,
     }
 }
 
@@ -742,8 +734,6 @@ async fn turn_handles_empty_text_response() {
     let provider = Box::new(ScriptedProvider::new(vec![ChatResponse {
         text: Some(String::new()),
         tool_calls: vec![],
-        usage: None,
-        reasoning_content: None,
     }]));
 
     let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
@@ -757,8 +747,6 @@ async fn turn_handles_none_text_response() {
     let provider = Box::new(ScriptedProvider::new(vec![ChatResponse {
         text: None,
         tool_calls: vec![],
-        usage: None,
-        reasoning_content: None,
     }]));
 
     let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
@@ -782,8 +770,6 @@ async fn turn_preserves_text_alongside_tool_calls() {
                 name: "echo".into(),
                 arguments: r#"{"message": "hi"}"#.into(),
             }],
-            usage: None,
-            reasoning_content: None,
         },
         text_response("Here are the results"),
     ]));
@@ -1020,8 +1006,6 @@ async fn native_dispatcher_handles_stringified_arguments() {
             name: "echo".into(),
             arguments: r#"{"message": "hello"}"#.into(),
         }],
-        usage: None,
-        reasoning_content: None,
     };
 
     let (_, calls) = dispatcher.parse_response(&response);
@@ -1047,8 +1031,6 @@ fn xml_dispatcher_handles_nested_json() {
                 .into(),
         ),
         tool_calls: vec![],
-        usage: None,
-        reasoning_content: None,
     };
 
     let dispatcher = XmlToolDispatcher;
@@ -1066,8 +1048,6 @@ fn xml_dispatcher_handles_empty_tool_call_tag() {
     let response = ChatResponse {
         text: Some("<tool_call>\n</tool_call>\nSome text".into()),
         tool_calls: vec![],
-        usage: None,
-        reasoning_content: None,
     };
 
     let dispatcher = XmlToolDispatcher;
@@ -1081,8 +1061,6 @@ fn xml_dispatcher_handles_unclosed_tool_call() {
     let response = ChatResponse {
         text: Some("Before\n<tool_call>\n{\"name\": \"shell\"}".into()),
         tool_calls: vec![],
-        usage: None,
-        reasoning_content: None,
     };
 
     let dispatcher = XmlToolDispatcher;
@@ -1108,7 +1086,6 @@ fn conversation_message_serialization_roundtrip() {
                 name: "shell".into(),
                 arguments: "{}".into(),
             }],
-            reasoning_content: None,
         },
         ConversationMessage::ToolResults(vec![ToolResultMessage {
             tool_call_id: "tc1".into(),
@@ -1131,12 +1108,10 @@ fn conversation_message_serialization_roundtrip() {
                 ConversationMessage::AssistantToolCalls {
                     text: a_text,
                     tool_calls: a_calls,
-                    ..
                 },
                 ConversationMessage::AssistantToolCalls {
                     text: b_text,
                     tool_calls: b_calls,
-                    ..
                 },
             ) => {
                 assert_eq!(a_text, b_text);
@@ -1233,7 +1208,6 @@ fn xml_dispatcher_converts_history_to_provider_messages() {
                 name: "shell".into(),
                 arguments: "{}".into(),
             }],
-            reasoning_content: None,
         },
         ConversationMessage::ToolResults(vec![ToolResultMessage {
             tool_call_id: "tc1".into(),

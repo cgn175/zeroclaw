@@ -1,7 +1,5 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Slack channel — polls conversations.history via Web API
 pub struct SlackChannel {
@@ -56,126 +54,6 @@ impl SlackChannel {
             .or(if ts.is_empty() { None } else { Some(ts) })
             .map(str::to_string)
     }
-
-    fn normalized_channel_id(input: Option<&str>) -> Option<String> {
-        input
-            .map(str::trim)
-            .filter(|v| !v.is_empty() && *v != "*")
-            .map(ToOwned::to_owned)
-    }
-
-    fn configured_channel_id(&self) -> Option<String> {
-        Self::normalized_channel_id(self.channel_id.as_deref())
-    }
-
-    fn extract_channel_ids(list_payload: &serde_json::Value) -> Vec<String> {
-        let mut ids = list_payload
-            .get("channels")
-            .and_then(|c| c.as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|channel| {
-                let id = channel.get("id").and_then(|id| id.as_str())?;
-                let is_archived = channel
-                    .get("is_archived")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let is_member = channel
-                    .get("is_member")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                if is_archived || !is_member {
-                    return None;
-                }
-                Some(id.to_string())
-            })
-            .collect::<Vec<_>>();
-        ids.sort();
-        ids.dedup();
-        ids
-    }
-
-    async fn list_accessible_channels(&self) -> anyhow::Result<Vec<String>> {
-        let mut channels = Vec::new();
-        let mut cursor: Option<String> = None;
-
-        loop {
-            let mut query_params = vec![
-                ("exclude_archived", "true".to_string()),
-                ("limit", "200".to_string()),
-                (
-                    "types",
-                    "public_channel,private_channel,mpim,im".to_string(),
-                ),
-            ];
-            if let Some(ref next) = cursor {
-                query_params.push(("cursor", next.clone()));
-            }
-
-            let resp = self
-                .http_client()
-                .get("https://slack.com/api/conversations.list")
-                .bearer_auth(&self.bot_token)
-                .query(&query_params)
-                .send()
-                .await?;
-
-            let status = resp.status();
-            let body = resp
-                .text()
-                .await
-                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-
-            if !status.is_success() {
-                anyhow::bail!("Slack conversations.list failed ({status}): {body}");
-            }
-
-            let data: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-            if data.get("ok") == Some(&serde_json::Value::Bool(false)) {
-                let err = data
-                    .get("error")
-                    .and_then(|e| e.as_str())
-                    .unwrap_or("unknown");
-                anyhow::bail!("Slack conversations.list failed: {err}");
-            }
-
-            channels.extend(Self::extract_channel_ids(&data));
-
-            cursor = data
-                .get("response_metadata")
-                .and_then(|rm| rm.get("next_cursor"))
-                .and_then(|c| c.as_str())
-                .map(str::trim)
-                .filter(|c| !c.is_empty())
-                .map(ToOwned::to_owned);
-
-            if cursor.is_none() {
-                break;
-            }
-        }
-
-        channels.sort();
-        channels.dedup();
-        Ok(channels)
-    }
-
-    fn slack_now_ts() -> String {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        format!("{}.{:06}", now.as_secs(), now.subsec_micros())
-    }
-
-    fn ensure_poll_cursor(
-        cursors: &mut HashMap<String, String>,
-        channel_id: &str,
-        now_ts: &str,
-    ) -> String {
-        cursors
-            .entry(channel_id.to_string())
-            .or_insert_with(|| now_ts.to_string())
-            .clone()
-    }
 }
 
 #[async_trait]
@@ -226,154 +104,90 @@ impl Channel for SlackChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        let bot_user_id = self.get_bot_user_id().await.unwrap_or_default();
-        let scoped_channel = self.configured_channel_id();
-        let mut discovered_channels: Vec<String> = Vec::new();
-        let mut last_discovery = Instant::now();
-        let mut last_ts_by_channel: HashMap<String, String> = HashMap::new();
+        let channel_id = self
+            .channel_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Slack channel_id required for listening"))?;
 
-        if let Some(ref channel_id) = scoped_channel {
-            tracing::info!("Slack channel listening on #{channel_id}...");
-        } else {
-            tracing::info!(
-                "Slack channel_id not set (or '*'); listening across all accessible channels."
-            );
-        }
+        let bot_user_id = self.get_bot_user_id().await.unwrap_or_default();
+        let mut last_ts = String::new();
+
+        tracing::info!("Slack channel listening on #{channel_id}...");
 
         loop {
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-            let target_channels = if let Some(ref channel_id) = scoped_channel {
-                vec![channel_id.clone()]
-            } else {
-                if discovered_channels.is_empty()
-                    || last_discovery.elapsed() >= Duration::from_secs(60)
-                {
-                    match self.list_accessible_channels().await {
-                        Ok(channels) => {
-                            if channels != discovered_channels {
-                                tracing::info!(
-                                    "Slack auto-discovery refreshed: listening on {} channel(s).",
-                                    channels.len()
-                                );
-                            }
-                            discovered_channels = channels;
-                        }
-                        Err(e) => {
-                            tracing::warn!("Slack channel discovery failed: {e}");
-                        }
-                    }
-                    last_discovery = Instant::now();
-                }
-
-                discovered_channels.clone()
-            };
-
-            if target_channels.is_empty() {
-                tracing::debug!("Slack: no accessible channels discovered yet");
-                continue;
+            let mut params = vec![("channel", channel_id.clone()), ("limit", "10".to_string())];
+            if !last_ts.is_empty() {
+                params.push(("oldest", last_ts.clone()));
             }
 
-            for channel_id in target_channels {
-                let had_cursor = last_ts_by_channel.contains_key(&channel_id);
-                let bootstrap_ts = Self::slack_now_ts();
-                let cursor_ts =
-                    Self::ensure_poll_cursor(&mut last_ts_by_channel, &channel_id, &bootstrap_ts);
-                if !had_cursor {
-                    tracing::debug!(
-                        "Slack: initialized cursor for channel {} at {} to prevent historical replay",
-                        channel_id,
-                        cursor_ts
-                    );
-                }
-                let params = vec![
-                    ("channel", channel_id.clone()),
-                    ("limit", "10".to_string()),
-                    ("oldest", cursor_ts),
-                ];
-
-                let resp = match self
-                    .http_client()
-                    .get("https://slack.com/api/conversations.history")
-                    .bearer_auth(&self.bot_token)
-                    .query(&params)
-                    .send()
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!("Slack poll error for channel {channel_id}: {e}");
-                        continue;
-                    }
-                };
-
-                let data: serde_json::Value = match resp.json().await {
-                    Ok(d) => d,
-                    Err(e) => {
-                        tracing::warn!("Slack parse error for channel {channel_id}: {e}");
-                        continue;
-                    }
-                };
-
-                if data.get("ok") == Some(&serde_json::Value::Bool(false)) {
-                    let err = data
-                        .get("error")
-                        .and_then(|e| e.as_str())
-                        .unwrap_or("unknown");
-                    tracing::warn!("Slack history error for channel {channel_id}: {err}");
+            let resp = match self
+                .http_client()
+                .get("https://slack.com/api/conversations.history")
+                .bearer_auth(&self.bot_token)
+                .query(&params)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("Slack poll error: {e}");
                     continue;
                 }
+            };
 
-                if let Some(messages) = data.get("messages").and_then(|m| m.as_array()) {
-                    // Messages come newest-first, reverse to process oldest first
-                    for msg in messages.iter().rev() {
-                        let ts = msg.get("ts").and_then(|t| t.as_str()).unwrap_or("");
-                        let user = msg
-                            .get("user")
-                            .and_then(|u| u.as_str())
-                            .unwrap_or("unknown");
-                        let text = msg.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                        let last_ts = last_ts_by_channel
-                            .get(&channel_id)
-                            .map(String::as_str)
-                            .unwrap_or("");
+            let data: serde_json::Value = match resp.json().await {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("Slack parse error: {e}");
+                    continue;
+                }
+            };
 
-                        // Skip bot's own messages
-                        if user == bot_user_id {
-                            continue;
-                        }
+            if let Some(messages) = data.get("messages").and_then(|m| m.as_array()) {
+                // Messages come newest-first, reverse to process oldest first
+                for msg in messages.iter().rev() {
+                    let ts = msg.get("ts").and_then(|t| t.as_str()).unwrap_or("");
+                    let user = msg
+                        .get("user")
+                        .and_then(|u| u.as_str())
+                        .unwrap_or("unknown");
+                    let text = msg.get("text").and_then(|t| t.as_str()).unwrap_or("");
 
-                        // Sender validation
-                        if !self.is_user_allowed(user) {
-                            tracing::warn!(
-                                "Slack: ignoring message from unauthorized user: {user}"
-                            );
-                            continue;
-                        }
+                    // Skip bot's own messages
+                    if user == bot_user_id {
+                        continue;
+                    }
 
-                        // Skip empty or already-seen
-                        if text.is_empty() || ts <= last_ts {
-                            continue;
-                        }
+                    // Sender validation
+                    if !self.is_user_allowed(user) {
+                        tracing::warn!("Slack: ignoring message from unauthorized user: {user}");
+                        continue;
+                    }
 
-                        last_ts_by_channel.insert(channel_id.clone(), ts.to_string());
+                    // Skip empty or already-seen
+                    if text.is_empty() || ts <= last_ts.as_str() {
+                        continue;
+                    }
 
-                        let channel_msg = ChannelMessage {
-                            id: format!("slack_{channel_id}_{ts}"),
-                            sender: user.to_string(),
-                            reply_target: channel_id.clone(),
-                            content: text.to_string(),
-                            channel: "slack".to_string(),
-                            timestamp: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs(),
-                            thread_ts: Self::inbound_thread_ts(msg, ts),
-                        };
+                    last_ts = ts.to_string();
 
-                        if tx.send(channel_msg).await.is_err() {
-                            return Ok(());
-                        }
+                    let channel_msg = ChannelMessage {
+                        id: format!("slack_{channel_id}_{ts}"),
+                        sender: user.to_string(),
+                        reply_target: channel_id.clone(),
+                        content: text.to_string(),
+                        channel: "slack".to_string(),
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                        thread_ts: Self::inbound_thread_ts(msg, ts),
+                    };
+
+                    if tx.send(channel_msg).await.is_err() {
+                        return Ok(());
                     }
                 }
             }
@@ -405,34 +219,6 @@ mod tests {
     fn slack_channel_with_channel_id() {
         let ch = SlackChannel::new("xoxb-fake".into(), Some("C12345".into()), vec![]);
         assert_eq!(ch.channel_id, Some("C12345".to_string()));
-    }
-
-    #[test]
-    fn normalized_channel_id_respects_wildcard_and_blank() {
-        assert_eq!(SlackChannel::normalized_channel_id(None), None);
-        assert_eq!(SlackChannel::normalized_channel_id(Some("")), None);
-        assert_eq!(SlackChannel::normalized_channel_id(Some("   ")), None);
-        assert_eq!(SlackChannel::normalized_channel_id(Some("*")), None);
-        assert_eq!(SlackChannel::normalized_channel_id(Some(" * ")), None);
-        assert_eq!(
-            SlackChannel::normalized_channel_id(Some(" C12345 ")),
-            Some("C12345".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_channel_ids_filters_archived_and_non_member_entries() {
-        let payload = serde_json::json!({
-            "channels": [
-                {"id": "C1", "is_archived": false, "is_member": true},
-                {"id": "C2", "is_archived": true, "is_member": true},
-                {"id": "C3", "is_archived": false, "is_member": false},
-                {"id": "C1", "is_archived": false, "is_member": true},
-                {"id": "C4"}
-            ]
-        });
-        let ids = SlackChannel::extract_channel_ids(&payload);
-        assert_eq!(ids, vec!["C1".to_string(), "C4".to_string()]);
     }
 
     #[test]
@@ -559,27 +345,5 @@ mod tests {
 
         let thread_ts = SlackChannel::inbound_thread_ts(&msg, "");
         assert_eq!(thread_ts, None);
-    }
-
-    #[test]
-    fn ensure_poll_cursor_bootstraps_new_channel() {
-        let mut cursors = HashMap::new();
-        let now_ts = "1700000000.123456";
-
-        let cursor = SlackChannel::ensure_poll_cursor(&mut cursors, "C123", now_ts);
-        assert_eq!(cursor, now_ts);
-        assert_eq!(cursors.get("C123").map(String::as_str), Some(now_ts));
-    }
-
-    #[test]
-    fn ensure_poll_cursor_keeps_existing_cursor() {
-        let mut cursors = HashMap::from([("C123".to_string(), "1700000000.000001".to_string())]);
-        let cursor = SlackChannel::ensure_poll_cursor(&mut cursors, "C123", "9999999999.999999");
-
-        assert_eq!(cursor, "1700000000.000001");
-        assert_eq!(
-            cursors.get("C123").map(String::as_str),
-            Some("1700000000.000001")
-        );
     }
 }

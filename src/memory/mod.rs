@@ -1,14 +1,11 @@
 pub mod backend;
 pub mod chunker;
-pub mod cli;
 pub mod embeddings;
 pub mod hygiene;
 pub mod lucid;
 pub mod markdown;
 pub mod none;
-#[cfg(feature = "memory-postgres")]
 pub mod postgres;
-pub mod qdrant;
 pub mod response_cache;
 pub mod snapshot;
 pub mod sqlite;
@@ -23,9 +20,7 @@ pub use backend::{
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
-#[cfg(feature = "memory-postgres")]
 pub use postgres::PostgresMemory;
-pub use qdrant::QdrantMemory;
 pub use response_cache::ResponseCache;
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
@@ -46,7 +41,7 @@ fn create_memory_with_builders<F, G>(
 ) -> anyhow::Result<Box<dyn Memory>>
 where
     F: FnMut() -> anyhow::Result<SqliteMemory>,
-    G: FnMut() -> anyhow::Result<Box<dyn Memory>>,
+    G: FnMut() -> anyhow::Result<PostgresMemory>,
 {
     match classify_memory_backend(backend_name) {
         MemoryBackendKind::Sqlite => Ok(Box::new(sqlite_builder()?)),
@@ -54,10 +49,8 @@ where
             let local = sqlite_builder()?;
             Ok(Box::new(LucidMemory::new(workspace_dir, local)))
         }
-        MemoryBackendKind::Postgres => postgres_builder(),
-        MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
-            Ok(Box::new(MarkdownMemory::new(workspace_dir)))
-        }
+        MemoryBackendKind::Postgres => Ok(Box::new(postgres_builder()?)),
+        MemoryBackendKind::Markdown => Ok(Box::new(MarkdownMemory::new(workspace_dir))),
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
         MemoryBackendKind::Unknown => {
             tracing::warn!(
@@ -103,7 +96,8 @@ impl std::fmt::Debug for ResolvedEmbeddingConfig {
             .field("provider", &self.provider)
             .field("model", &self.model)
             .field("dimensions", &self.dimensions)
-            .finish_non_exhaustive()
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .finish()
     }
 }
 
@@ -265,10 +259,9 @@ pub fn create_memory_with_storage_and_routes(
         Ok(mem)
     }
 
-    #[cfg(feature = "memory-postgres")]
     fn build_postgres_memory(
         storage_provider: Option<&StorageProviderConfig>,
-    ) -> anyhow::Result<Box<dyn Memory>> {
+    ) -> anyhow::Result<PostgresMemory> {
         let storage_provider = storage_provider
             .context("memory backend 'postgres' requires [storage.provider.config] settings")?;
         let db_url = storage_provider
@@ -280,63 +273,12 @@ pub fn create_memory_with_storage_and_routes(
                 "memory backend 'postgres' requires [storage.provider.config].db_url (or dbURL)",
             )?;
 
-        let memory = PostgresMemory::new(
+        PostgresMemory::new(
             db_url,
             &storage_provider.schema,
             &storage_provider.table,
             storage_provider.connect_timeout_secs,
-        )?;
-        Ok(Box::new(memory))
-    }
-
-    #[cfg(not(feature = "memory-postgres"))]
-    fn build_postgres_memory(
-        _storage_provider: Option<&StorageProviderConfig>,
-    ) -> anyhow::Result<Box<dyn Memory>> {
-        anyhow::bail!(
-            "memory backend 'postgres' requested but this build was compiled without `memory-postgres`; rebuild with `--features memory-postgres`"
-        );
-    }
-
-    if matches!(backend_kind, MemoryBackendKind::Qdrant) {
-        let url = config
-            .qdrant
-            .url
-            .clone()
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| std::env::var("QDRANT_URL").ok())
-            .filter(|s| !s.trim().is_empty())
-            .context(
-                "Qdrant memory backend requires url in [memory.qdrant] or QDRANT_URL env var",
-            )?;
-        let collection = std::env::var("QDRANT_COLLECTION")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| config.qdrant.collection.clone());
-        let qdrant_api_key = config
-            .qdrant
-            .api_key
-            .clone()
-            .or_else(|| std::env::var("QDRANT_API_KEY").ok())
-            .filter(|s| !s.trim().is_empty());
-        let embedder: Arc<dyn embeddings::EmbeddingProvider> =
-            Arc::from(embeddings::create_embedding_provider(
-                &resolved_embedding.provider,
-                resolved_embedding.api_key.as_deref(),
-                &resolved_embedding.model,
-                resolved_embedding.dimensions,
-            ));
-        tracing::info!(
-            "📦 Qdrant memory backend configured (url: {}, collection: {})",
-            url,
-            collection
-        );
-        return Ok(Box::new(QdrantMemory::new_lazy(
-            &url,
-            &collection,
-            qdrant_api_key,
-            embedder,
-        )));
+        )
     }
 
     create_memory_with_builders(
@@ -518,11 +460,7 @@ mod tests {
         let error = create_memory_with_storage(&cfg, Some(&storage), tmp.path(), None)
             .err()
             .expect("postgres without db_url should be rejected");
-        if cfg!(feature = "memory-postgres") {
-            assert!(error.to_string().contains("db_url"));
-        } else {
-            assert!(error.to_string().contains("memory-postgres"));
-        }
+        assert!(error.to_string().contains("db_url"));
     }
 
     #[test]

@@ -379,7 +379,7 @@ mod tests {
     #[test]
     fn summarize_args_truncates_long_values() {
         let long_val = "x".repeat(200);
-        let args = serde_json::json!({ "content": long_val });
+        let args = serde_json::json!({"content": long_val});
         let summary = summarize_args(&args);
         assert!(summary.contains('…'));
         assert!(summary.len() < 200);
@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn summarize_args_unicode_safe_truncation() {
         let long_val = "🦀".repeat(120);
-        let args = serde_json::json!({ "content": long_val });
+        let args = serde_json::json!({"content": long_val});
         let summary = summarize_args(&args);
         assert!(summary.contains("content:"));
         assert!(summary.contains('…'));

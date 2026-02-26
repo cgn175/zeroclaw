@@ -80,7 +80,6 @@
 ## Инвентаризация и структура docs
 
 - Единый TOC: [SUMMARY.md](SUMMARY.md)
-- Карта структуры docs (язык/раздел/функция): [structure/README.md](structure/README.md)
 - Инвентарь и классификация docs: [docs-inventory.md](docs-inventory.md)
 
 ## Другие языки
@@ -88,5 +87,3 @@
 - English: [README.md](README.md)
 - 简体中文: [README.zh-CN.md](README.zh-CN.md)
 - 日本語: [README.ja.md](README.ja.md)
-- Français: [README.fr.md](README.fr.md)
-- Tiếng Việt: [i18n/vi/README.md](i18n/vi/README.md)

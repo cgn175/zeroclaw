@@ -69,7 +69,7 @@ CARGO_BUILD_JOBS=1 cargo build --release --locked
 1. Reduce heavy features when Matrix is not required:
 
 ```bash
-cargo build --release --locked --features hardware
+cargo build --release --locked --no-default-features --features hardware
 ```
 
 1. Cross-compile on a stronger machine and copy the binary to the target host.
@@ -100,21 +100,15 @@ The timing report is written to `target/cargo-timings/cargo-timing.html`.
 Faster local iteration (when Matrix channel is not needed):
 
 ```bash
-cargo check
+cargo check --no-default-features --features hardware
 ```
 
-This uses the lean default feature set and can significantly reduce compile time.
+This skips `channel-matrix` and can significantly reduce compile time.
 
 To build with Matrix support explicitly enabled:
 
 ```bash
-cargo check --features channel-matrix
-```
-
-To build with Matrix + Lark + hardware support:
-
-```bash
-cargo check --features hardware,channel-matrix,channel-lark
+cargo check --no-default-features --features hardware,channel-matrix
 ```
 
 Lock-contention mitigation:
@@ -154,7 +148,7 @@ zeroclaw doctor
 Verify `~/.zeroclaw/config.toml`:
 
 - `[gateway].host` (default `127.0.0.1`)
-- `[gateway].port` (default `42617`)
+- `[gateway].port` (default `3000`)
 - `allow_public_bind` only when intentionally exposing LAN/public interfaces
 
 ### Pairing / auth failures on webhook

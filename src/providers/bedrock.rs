@@ -6,7 +6,7 @@
 
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall, ToolsPayload,
+    Provider, ProviderCapabilities, ToolCall as ProviderToolCall, ToolsPayload,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -33,7 +33,10 @@ struct AwsCredentials {
 }
 
 impl AwsCredentials {
-    /// Resolve credentials: first try environment variables, then EC2 IMDSv2.
+    /// Resolve credentials from environment variables.
+    ///
+    /// Required: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`.
+    /// Optional: `AWS_SESSION_TOKEN`, `AWS_REGION` / `AWS_DEFAULT_REGION`.
     fn from_env() -> anyhow::Result<Self> {
         let access_key_id = env_required("AWS_ACCESS_KEY_ID")?;
         let secret_access_key = env_required("AWS_SECRET_ACCESS_KEY")?;
@@ -50,94 +53,6 @@ impl AwsCredentials {
             session_token,
             region,
         })
-    }
-
-    /// Fetch credentials from EC2 IMDSv2 instance metadata service.
-    async fn from_imds() -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(3))
-            .build()?;
-
-        // Step 1: get IMDSv2 token
-        let token = client
-            .put("http://169.254.169.254/latest/api/token")
-            .header("X-aws-ec2-metadata-token-ttl-seconds", "21600")
-            .send()
-            .await?
-            .text()
-            .await?;
-
-        // Step 2: get IAM role name
-        let role = client
-            .get("http://169.254.169.254/latest/meta-data/iam/security-credentials/")
-            .header("X-aws-ec2-metadata-token", &token)
-            .send()
-            .await?
-            .text()
-            .await?;
-        let role = role.trim().to_string();
-        anyhow::ensure!(!role.is_empty(), "No IAM role attached to this instance");
-
-        // Step 3: get credentials for that role
-        let creds_url = format!(
-            "http://169.254.169.254/latest/meta-data/iam/security-credentials/{}",
-            role
-        );
-        let creds_json: serde_json::Value = client
-            .get(&creds_url)
-            .header("X-aws-ec2-metadata-token", &token)
-            .send()
-            .await?
-            .json()
-            .await?;
-
-        let access_key_id = creds_json["AccessKeyId"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing AccessKeyId in IMDS response"))?
-            .to_string();
-        let secret_access_key = creds_json["SecretAccessKey"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing SecretAccessKey in IMDS response"))?
-            .to_string();
-        let session_token = creds_json["Token"].as_str().map(|s| s.to_string());
-
-        // Step 4: get region from instance identity document
-        let region = match client
-            .get("http://169.254.169.254/latest/meta-data/placement/region")
-            .header("X-aws-ec2-metadata-token", &token)
-            .send()
-            .await
-        {
-            Ok(resp) => resp.text().await.unwrap_or_default(),
-            Err(_) => String::new(),
-        };
-        let region = if region.trim().is_empty() {
-            env_optional("AWS_REGION")
-                .or_else(|| env_optional("AWS_DEFAULT_REGION"))
-                .unwrap_or_else(|| DEFAULT_REGION.to_string())
-        } else {
-            region.trim().to_string()
-        };
-
-        tracing::info!(
-            "Loaded AWS credentials from EC2 instance metadata (role: {})",
-            role
-        );
-
-        Ok(Self {
-            access_key_id,
-            secret_access_key,
-            session_token,
-            region,
-        })
-    }
-
-    /// Resolve credentials: env vars first, then EC2 IMDS.
-    async fn resolve() -> anyhow::Result<Self> {
-        if let Ok(creds) = Self::from_env() {
-            return Ok(creds);
-        }
-        Self::from_imds().await
     }
 
     fn host(&self) -> String {
@@ -275,24 +190,6 @@ enum ContentBlock {
     ToolUse(ToolUseWrapper),
     ToolResult(ToolResultWrapper),
     CachePointBlock(CachePointWrapper),
-    Image(ImageWrapper),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ImageWrapper {
-    image: ImageBlock,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ImageBlock {
-    format: String,
-    source: ImageSource,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ImageSource {
-    bytes: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -403,17 +300,6 @@ struct ConverseResponse {
     #[serde(default)]
     #[allow(dead_code)]
     stop_reason: Option<String>,
-    #[serde(default)]
-    usage: Option<BedrockUsage>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BedrockUsage {
-    #[serde(default)]
-    input_tokens: Option<u64>,
-    #[serde(default)]
-    output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -462,11 +348,6 @@ impl BedrockProvider {
         }
     }
 
-    pub async fn new_async() -> Self {
-        let credentials = AwsCredentials::resolve().await.ok();
-        Self { credentials }
-    }
-
     fn http_client(&self) -> Client {
         crate::config::build_runtime_proxy_client_with_timeouts("provider.bedrock", 120, 10)
     }
@@ -495,18 +376,9 @@ impl BedrockProvider {
         self.credentials.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "AWS Bedrock credentials not set. Set AWS_ACCESS_KEY_ID and \
-                 AWS_SECRET_ACCESS_KEY environment variables, or run on an EC2 \
-                 instance with an IAM role attached."
+                 AWS_SECRET_ACCESS_KEY environment variables."
             )
         })
-    }
-
-    /// Resolve credentials: use cached if available, otherwise fetch from IMDS.
-    async fn resolve_credentials(&self) -> anyhow::Result<AwsCredentials> {
-        if let Ok(creds) = AwsCredentials::from_env() {
-            return Ok(creds);
-        }
-        AwsCredentials::from_imds().await
     }
 
     // ── Cache heuristics (same thresholds as AnthropicProvider) ──
@@ -554,56 +426,23 @@ impl BedrockProvider {
                     }
                 }
                 "tool" => {
-                    let tool_result_msg = Self::parse_tool_result_message(&msg.content)
-                        .unwrap_or_else(|| {
-                            // Fallback: always emit a toolResult block so the
-                            // Bedrock API contract (every toolUse needs a matching
-                            // toolResult) is never violated.
-                            let tool_use_id = Self::extract_tool_call_id(&msg.content)
-                                .or_else(|| Self::last_pending_tool_use_id(&converse_messages))
-                                .unwrap_or_else(|| "unknown".to_string());
-
-                            tracing::warn!(
-                                "Failed to parse tool result message, creating error \
-                                 toolResult for tool_use_id={}",
-                                tool_use_id
-                            );
-
-                            ConverseMessage {
-                                role: "user".to_string(),
-                                content: vec![ContentBlock::ToolResult(ToolResultWrapper {
-                                    tool_result: ToolResultBlock {
-                                        tool_use_id,
-                                        content: vec![ToolResultContent {
-                                            text: msg.content.clone(),
-                                        }],
-                                        status: "error".to_string(),
-                                    },
-                                })],
-                            }
+                    if let Some(tool_result_msg) = Self::parse_tool_result_message(&msg.content) {
+                        converse_messages.push(tool_result_msg);
+                    } else {
+                        converse_messages.push(ConverseMessage {
+                            role: "user".to_string(),
+                            content: vec![ContentBlock::Text(TextBlock {
+                                text: msg.content.clone(),
+                            })],
                         });
-
-                    // Merge consecutive tool results into a single user message.
-                    // Bedrock requires all toolResult blocks for a multi-tool-call
-                    // turn to appear in one user message.
-                    if let Some(last) = converse_messages.last_mut() {
-                        if last.role == "user"
-                            && last
-                                .content
-                                .iter()
-                                .all(|b| matches!(b, ContentBlock::ToolResult(_)))
-                        {
-                            last.content.extend(tool_result_msg.content);
-                            continue;
-                        }
                     }
-                    converse_messages.push(tool_result_msg);
                 }
                 _ => {
-                    let content_blocks = Self::parse_user_content_blocks(&msg.content);
                     converse_messages.push(ConverseMessage {
                         role: "user".to_string(),
-                        content: content_blocks,
+                        content: vec![ContentBlock::Text(TextBlock {
+                            text: msg.content.clone(),
+                        })],
                     });
                 }
             }
@@ -615,133 +454,6 @@ impl BedrockProvider {
             Some(system_blocks)
         };
         (system, converse_messages)
-    }
-
-    /// Try to extract a tool_call_id from partially-valid JSON content.
-    fn extract_tool_call_id(content: &str) -> Option<String> {
-        let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
-        value
-            .get("tool_call_id")
-            .or_else(|| value.get("tool_use_id"))
-            .or_else(|| value.get("toolUseId"))
-            .and_then(serde_json::Value::as_str)
-            .map(String::from)
-    }
-
-    /// Find the first unmatched tool_use_id from the last assistant message.
-    ///
-    /// When a tool result can't be parsed at all (not even the ID), we fall
-    /// back to matching it against the preceding assistant turn's toolUse
-    /// blocks that don't yet have a corresponding toolResult.
-    fn last_pending_tool_use_id(converse_messages: &[ConverseMessage]) -> Option<String> {
-        let last_assistant = converse_messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "assistant")?;
-
-        let tool_use_ids: Vec<&str> = last_assistant
-            .content
-            .iter()
-            .filter_map(|b| match b {
-                ContentBlock::ToolUse(wrapper) => Some(wrapper.tool_use.tool_use_id.as_str()),
-                _ => None,
-            })
-            .collect();
-
-        let answered_ids: Vec<&str> = converse_messages
-            .iter()
-            .rev()
-            .take_while(|m| m.role == "user")
-            .flat_map(|m| m.content.iter())
-            .filter_map(|b| match b {
-                ContentBlock::ToolResult(wrapper) => Some(wrapper.tool_result.tool_use_id.as_str()),
-                _ => None,
-            })
-            .collect();
-
-        tool_use_ids
-            .into_iter()
-            .find(|id| !answered_ids.contains(id))
-            .map(String::from)
-    }
-
-    /// Parse user message content, extracting [IMAGE:data:...] markers into image blocks.
-    fn parse_user_content_blocks(content: &str) -> Vec<ContentBlock> {
-        let mut blocks: Vec<ContentBlock> = Vec::new();
-        let mut remaining = content;
-        let has_image = content.contains("[IMAGE:");
-        tracing::info!(
-            "parse_user_content_blocks called, len={}, has_image={}",
-            content.len(),
-            has_image
-        );
-
-        while let Some(start) = remaining.find("[IMAGE:") {
-            // Add any text before the marker
-            let text_before = &remaining[..start];
-            if !text_before.trim().is_empty() {
-                blocks.push(ContentBlock::Text(TextBlock {
-                    text: text_before.to_string(),
-                }));
-            }
-
-            let after = &remaining[start + 7..]; // skip "[IMAGE:"
-            if let Some(end) = after.find(']') {
-                let src = &after[..end];
-                remaining = &after[end + 1..];
-
-                // Only handle data URIs (base64 encoded images)
-                if let Some(rest) = src.strip_prefix("data:") {
-                    if let Some(semi) = rest.find(';') {
-                        let mime = &rest[..semi];
-                        let after_semi = &rest[semi + 1..];
-                        if let Some(b64) = after_semi.strip_prefix("base64,") {
-                            let format = match mime {
-                                "image/jpeg" | "image/jpg" => "jpeg",
-                                "image/png" => "png",
-                                "image/gif" => "gif",
-                                "image/webp" => "webp",
-                                _ => "jpeg",
-                            };
-                            blocks.push(ContentBlock::Image(ImageWrapper {
-                                image: ImageBlock {
-                                    format: format.to_string(),
-                                    source: ImageSource {
-                                        bytes: b64.to_string(),
-                                    },
-                                },
-                            }));
-                            continue;
-                        }
-                    }
-                }
-                // Non-data-uri image: just include as text reference
-                blocks.push(ContentBlock::Text(TextBlock {
-                    text: format!("[image: {}]", src),
-                }));
-            } else {
-                // No closing bracket, treat rest as text
-                blocks.push(ContentBlock::Text(TextBlock {
-                    text: remaining.to_string(),
-                }));
-                break;
-            }
-        }
-
-        // Add any remaining text
-        if !remaining.trim().is_empty() {
-            blocks.push(ContentBlock::Text(TextBlock {
-                text: remaining.to_string(),
-            }));
-        }
-
-        if blocks.is_empty() {
-            blocks.push(ContentBlock::Text(TextBlock {
-                text: content.to_string(),
-            }));
-        }
-
-        blocks
     }
 
     /// Parse assistant message containing structured tool calls.
@@ -781,8 +493,6 @@ impl BedrockProvider {
         let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
         let tool_use_id = value
             .get("tool_call_id")
-            .or_else(|| value.get("tool_use_id"))
-            .or_else(|| value.get("toolUseId"))
             .and_then(serde_json::Value::as_str)?
             .to_string();
         let result = value
@@ -830,11 +540,6 @@ impl BedrockProvider {
         let mut text_parts = Vec::new();
         let mut tool_calls = Vec::new();
 
-        let usage = response.usage.map(|u| TokenUsage {
-            input_tokens: u.input_tokens,
-            output_tokens: u.output_tokens,
-        });
-
         if let Some(output) = response.output {
             if let Some(message) = output.message {
                 for block in message.content {
@@ -867,8 +572,6 @@ impl BedrockProvider {
                 Some(text_parts.join("\n"))
             },
             tool_calls,
-            usage,
-            reasoning_content: None,
         }
     }
 
@@ -881,37 +584,6 @@ impl BedrockProvider {
         request_body: &ConverseRequest,
     ) -> anyhow::Result<ConverseResponse> {
         let payload = serde_json::to_vec(request_body)?;
-
-        // Debug: log image blocks in payload (truncated)
-        if let Ok(debug_val) = serde_json::from_slice::<serde_json::Value>(&payload) {
-            if let Some(msgs) = debug_val.get("messages").and_then(|m| m.as_array()) {
-                for msg in msgs {
-                    if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
-                        for block in content {
-                            if block.get("image").is_some() {
-                                let mut b = block.clone();
-                                if let Some(img) = b.get_mut("image") {
-                                    if let Some(src) = img.get_mut("source") {
-                                        if let Some(bytes) = src.get_mut("bytes") {
-                                            if let Some(s) = bytes.as_str() {
-                                                *bytes = serde_json::json!(format!(
-                                                    "<base64 {} chars>",
-                                                    s.len()
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-                                tracing::info!(
-                                    "Bedrock image block: {}",
-                                    serde_json::to_string(&b).unwrap_or_default()
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
         let url = Self::endpoint_url(&credentials.region, model);
         let canonical_uri = Self::canonical_uri(model);
         let now = chrono::Utc::now();
@@ -967,7 +639,7 @@ impl Provider for BedrockProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_tool_calling: true,
-            vision: true,
+            vision: false,
         }
     }
 
@@ -998,7 +670,7 @@ impl Provider for BedrockProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let credentials = self.resolve_credentials().await?;
+        let credentials = self.require_credentials()?;
 
         let system = system_prompt.map(|text| {
             let mut blocks = vec![SystemBlock::Text(TextBlock {
@@ -1016,7 +688,9 @@ impl Provider for BedrockProvider {
             system,
             messages: vec![ConverseMessage {
                 role: "user".to_string(),
-                content: Self::parse_user_content_blocks(message),
+                content: vec![ContentBlock::Text(TextBlock {
+                    text: message.to_string(),
+                })],
             }],
             inference_config: Some(InferenceConfig {
                 max_tokens: DEFAULT_MAX_TOKENS,
@@ -1026,7 +700,7 @@ impl Provider for BedrockProvider {
         };
 
         let response = self
-            .send_converse_request(&credentials, model, &request)
+            .send_converse_request(credentials, model, &request)
             .await?;
 
         Self::parse_converse_response(response)
@@ -1040,7 +714,7 @@ impl Provider for BedrockProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credentials = self.resolve_credentials().await?;
+        let credentials = self.require_credentials()?;
 
         let (system_blocks, mut converse_messages) = Self::convert_messages(request.messages);
 
@@ -1081,7 +755,7 @@ impl Provider for BedrockProvider {
         };
 
         let response = self
-            .send_converse_request(&credentials, model, &converse_request)
+            .send_converse_request(credentials, model, &converse_request)
             .await?;
 
         Ok(Self::parse_converse_response(response))
@@ -1139,14 +813,24 @@ mod tests {
     #[test]
     fn derive_signing_key_structure() {
         // Verify the key derivation produces a 32-byte key (SHA-256 output).
-        let key = derive_signing_key(TEST_VECTOR_SECRET, "20150830", "us-east-1", "iam");
+        let key = derive_signing_key(
+            TEST_VECTOR_SECRET,
+            "20150830",
+            "us-east-1",
+            "iam",
+        );
         assert_eq!(key.len(), 32);
     }
 
     #[test]
     fn derive_signing_key_known_test_vector() {
         // AWS SigV4 test vector from documentation.
-        let key = derive_signing_key(TEST_VECTOR_SECRET, "20150830", "us-east-1", "iam");
+        let key = derive_signing_key(
+            TEST_VECTOR_SECRET,
+            "20150830",
+            "us-east-1",
+            "iam",
+        );
         assert_eq!(
             hex::encode(&key),
             "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9"
@@ -1261,10 +945,8 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("credentials not set")
-                || err.contains("169.254.169.254")
-                || err.to_lowercase().contains("credential"),
-            "Expected missing-credentials style error, got: {err}"
+            err.contains("credentials not set"),
+            "Expected credentials error, got: {err}"
         );
     }
 
@@ -1558,126 +1240,5 @@ mod tests {
         let provider = BedrockProvider { credentials: None };
         let caps = provider.capabilities();
         assert!(caps.native_tool_calling);
-    }
-
-    #[test]
-    fn converse_response_parses_usage() {
-        let json = r#"{
-            "output": {"message": {"role": "assistant", "content": [{"text": {"text": "Hello"}}]}},
-            "usage": {"inputTokens": 500, "outputTokens": 100}
-        }"#;
-        let resp: ConverseResponse = serde_json::from_str(json).unwrap();
-        let usage = resp.usage.unwrap();
-        assert_eq!(usage.input_tokens, Some(500));
-        assert_eq!(usage.output_tokens, Some(100));
-    }
-
-    #[test]
-    fn converse_response_parses_without_usage() {
-        let json = r#"{"output": {"message": {"role": "assistant", "content": []}}}"#;
-        let resp: ConverseResponse = serde_json::from_str(json).unwrap();
-        assert!(resp.usage.is_none());
-    }
-
-    // ── Tool result fallback & merge tests ───────────────────────
-
-    #[test]
-    fn fallback_tool_result_emits_tool_result_block_not_text() {
-        // When tool message content is not valid JSON, we should still get
-        // a toolResult block (not a plain text user message).
-        let messages = vec![
-            ChatMessage::user("do something"),
-            ChatMessage::assistant(
-                r#"{"content":"","tool_calls":[{"id":"tool_1","name":"shell","arguments":"{}"}]}"#,
-            ),
-            ChatMessage {
-                role: "tool".to_string(),
-                content: "not valid json".to_string(),
-            },
-        ];
-        let (_, msgs) = BedrockProvider::convert_messages(&messages);
-        let tool_msg = &msgs[2];
-        assert_eq!(tool_msg.role, "user");
-        assert!(
-            matches!(&tool_msg.content[0], ContentBlock::ToolResult(_)),
-            "Expected ToolResult block, got {:?}",
-            tool_msg.content[0]
-        );
-    }
-
-    #[test]
-    fn fallback_recovers_tool_use_id_from_assistant() {
-        let messages = vec![
-            ChatMessage::user("run it"),
-            ChatMessage::assistant(
-                r#"{"content":"","tool_calls":[{"id":"tool_abc","name":"shell","arguments":"{}"}]}"#,
-            ),
-            ChatMessage {
-                role: "tool".to_string(),
-                content: "raw output with no json".to_string(),
-            },
-        ];
-        let (_, msgs) = BedrockProvider::convert_messages(&messages);
-        if let ContentBlock::ToolResult(ref wrapper) = msgs[2].content[0] {
-            assert_eq!(wrapper.tool_result.tool_use_id, "tool_abc");
-            assert_eq!(wrapper.tool_result.status, "error");
-        } else {
-            panic!("Expected ToolResult block");
-        }
-    }
-
-    #[test]
-    fn consecutive_tool_results_merged_into_single_message() {
-        let messages = vec![
-            ChatMessage::user("do two things"),
-            ChatMessage::assistant(
-                r#"{"content":"","tool_calls":[{"id":"t1","name":"a","arguments":"{}"},{"id":"t2","name":"b","arguments":"{}"}]}"#,
-            ),
-            ChatMessage::tool(r#"{"tool_call_id":"t1","content":"result 1"}"#),
-            ChatMessage::tool(r#"{"tool_call_id":"t2","content":"result 2"}"#),
-        ];
-        let (_, msgs) = BedrockProvider::convert_messages(&messages);
-        // Should be: user, assistant, user (merged tool results)
-        assert_eq!(msgs.len(), 3, "Expected 3 messages, got {}", msgs.len());
-        assert_eq!(msgs[2].role, "user");
-        assert_eq!(
-            msgs[2].content.len(),
-            2,
-            "Expected 2 tool results in one message"
-        );
-        assert!(matches!(&msgs[2].content[0], ContentBlock::ToolResult(_)));
-        assert!(matches!(&msgs[2].content[1], ContentBlock::ToolResult(_)));
-    }
-
-    #[test]
-    fn extract_tool_call_id_tries_multiple_field_names() {
-        assert_eq!(
-            BedrockProvider::extract_tool_call_id(r#"{"tool_call_id":"a"}"#),
-            Some("a".to_string())
-        );
-        assert_eq!(
-            BedrockProvider::extract_tool_call_id(r#"{"tool_use_id":"b"}"#),
-            Some("b".to_string())
-        );
-        assert_eq!(
-            BedrockProvider::extract_tool_call_id(r#"{"toolUseId":"c"}"#),
-            Some("c".to_string())
-        );
-        assert_eq!(
-            BedrockProvider::extract_tool_call_id("not json at all"),
-            None
-        );
-    }
-
-    #[test]
-    fn parse_tool_result_accepts_alternate_id_fields() {
-        let msg =
-            BedrockProvider::parse_tool_result_message(r#"{"tool_use_id":"x","content":"ok"}"#);
-        assert!(msg.is_some());
-        if let ContentBlock::ToolResult(ref wrapper) = msg.unwrap().content[0] {
-            assert_eq!(wrapper.tool_result.tool_use_id, "x");
-        } else {
-            panic!("Expected ToolResult");
-        }
     }
 }

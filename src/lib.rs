@@ -51,7 +51,6 @@ pub mod gateway;
 pub(crate) mod hardware;
 pub(crate) mod health;
 pub(crate) mod heartbeat;
-pub mod hooks;
 pub(crate) mod identity;
 pub(crate) mod integrations;
 pub mod memory;
@@ -74,7 +73,7 @@ pub use config::Config;
 
 /// Service management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ServiceCommands {
+pub(crate) enum ServiceCommands {
     /// Install daemon service unit for auto-start and restart
     Install,
     /// Start daemon service
@@ -91,7 +90,7 @@ pub enum ServiceCommands {
 
 /// Channel management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ChannelCommands {
+pub(crate) enum ChannelCommands {
     /// List all configured channels
     List,
     /// Start all configured channels (handled in main.rs for async)
@@ -150,17 +149,12 @@ Examples:
 
 /// Skills management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum SkillCommands {
+pub(crate) enum SkillCommands {
     /// List all installed skills
     List,
-    /// Audit a skill source directory or installed skill name
-    Audit {
-        /// Skill path or installed skill name
-        source: String,
-    },
-    /// Install a new skill from a URL or local path
+    /// Install a new skill from a git URL (HTTPS/SSH) or local path
     Install {
-        /// Source URL or local path
+        /// Source git URL (HTTPS/SSH) or local path
         source: String,
     },
     /// Remove an installed skill
@@ -172,7 +166,7 @@ pub enum SkillCommands {
 
 /// Migration subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum MigrateCommands {
+pub(crate) enum MigrateCommands {
     /// Import memory from an `OpenClaw` workspace into this `ZeroClaw` workspace
     Openclaw {
         /// Optional path to `OpenClaw` workspace (defaults to ~/.openclaw/workspace)
@@ -187,7 +181,7 @@ pub enum MigrateCommands {
 
 /// Cron subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum CronCommands {
+pub(crate) enum CronCommands {
     /// List all scheduled tasks
     List,
     /// Add a new scheduled task
@@ -300,48 +294,9 @@ Examples:
     },
 }
 
-/// Memory management subcommands
-#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum MemoryCommands {
-    /// List memory entries with optional filters
-    List {
-        /// Filter by category (core, daily, conversation, or custom name)
-        #[arg(long)]
-        category: Option<String>,
-        /// Filter by session ID
-        #[arg(long)]
-        session: Option<String>,
-        /// Maximum number of entries to display
-        #[arg(long, default_value = "50")]
-        limit: usize,
-        /// Number of entries to skip (for pagination)
-        #[arg(long, default_value = "0")]
-        offset: usize,
-    },
-    /// Get a specific memory entry by key
-    Get {
-        /// Memory key to look up
-        key: String,
-    },
-    /// Show memory backend statistics and health
-    Stats,
-    /// Clear memories by category, by key, or clear all
-    Clear {
-        /// Delete a single entry by key (supports prefix match)
-        #[arg(long)]
-        key: Option<String>,
-        /// Only clear entries in this category
-        #[arg(long)]
-        category: Option<String>,
-        /// Skip confirmation prompt
-        #[arg(long)]
-        yes: bool,
-    },
-}
-
 /// Integration subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum IntegrationCommands {
+pub(crate) enum IntegrationCommands {
     /// Show details about a specific integration
     Info {
         /// Integration name

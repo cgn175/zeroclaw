@@ -13,7 +13,7 @@
 
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, TokenUsage, ToolCall as ProviderToolCall,
+    Provider, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -134,16 +134,6 @@ struct NativeFunctionCall {
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
     choices: Vec<Choice>,
-    #[serde(default)]
-    usage: Option<UsageInfo>,
-}
-
-#[derive(Debug, Deserialize)]
-struct UsageInfo {
-    #[serde(default)]
-    prompt_tokens: Option<u64>,
-    #[serde(default)]
-    completion_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -229,7 +219,7 @@ impl CopilotProvider {
         ("Accept", "application/json"),
     ];
 
-    fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec<'_>>> {
+    fn convert_tools<'a>(tools: Option<&'a [ToolSpec]>) -> Option<Vec<NativeToolSpec<'a>>> {
         tools.map(|items| {
             items
                 .iter()
@@ -350,10 +340,6 @@ impl CopilotProvider {
         }
 
         let api_response: ApiChatResponse = response.json().await?;
-        let usage = api_response.usage.map(|u| TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-        });
         let choice = api_response
             .choices
             .into_iter()
@@ -377,8 +363,6 @@ impl CopilotProvider {
         Ok(ProviderChatResponse {
             text: choice.message.content,
             tool_calls,
-            usage,
-            reasoning_content: None,
         })
     }
 
@@ -715,24 +699,5 @@ mod tests {
     fn supports_native_tools() {
         let provider = CopilotProvider::new(None);
         assert!(provider.supports_native_tools());
-    }
-
-    #[test]
-    fn api_response_parses_usage() {
-        let json = r#"{
-            "choices": [{"message": {"content": "Hello"}}],
-            "usage": {"prompt_tokens": 200, "completion_tokens": 80}
-        }"#;
-        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
-        let usage = resp.usage.unwrap();
-        assert_eq!(usage.prompt_tokens, Some(200));
-        assert_eq!(usage.completion_tokens, Some(80));
-    }
-
-    #[test]
-    fn api_response_parses_without_usage() {
-        let json = r#"{"choices": [{"message": {"content": "Hello"}}]}"#;
-        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
-        assert!(resp.usage.is_none());
     }
 }

@@ -87,8 +87,6 @@ mod tests {
             duration: Duration::from_millis(12),
             success: true,
             error_message: None,
-            input_tokens: Some(50),
-            output_tokens: Some(25),
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
             tool: "shell".into(),

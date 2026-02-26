@@ -64,8 +64,6 @@ impl Provider for MockProvider {
             return Ok(ChatResponse {
                 text: Some("done".into()),
                 tool_calls: vec![],
-                usage: None,
-                reasoning_content: None,
             });
         }
         Ok(guard.remove(0))
@@ -190,8 +188,6 @@ impl Provider for RecordingProvider {
             return Ok(ChatResponse {
                 text: Some("done".into()),
                 tool_calls: vec![],
-                usage: None,
-                reasoning_content: None,
             });
         }
         Ok(guard.remove(0))
@@ -239,8 +235,6 @@ fn text_response(text: &str) -> ChatResponse {
     ChatResponse {
         text: Some(text.into()),
         tool_calls: vec![],
-        usage: None,
-        reasoning_content: None,
     }
 }
 
@@ -248,8 +242,6 @@ fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
     ChatResponse {
         text: Some(String::new()),
         tool_calls: calls,
-        usage: None,
-        reasoning_content: None,
     }
 }
 
@@ -373,8 +365,6 @@ async fn e2e_xml_dispatcher_tool_call() {
                     .into(),
             ),
             tool_calls: vec![],
-            usage: None,
-            reasoning_content: None,
         },
         text_response("XML tool executed"),
     ]));
@@ -632,8 +622,7 @@ async fn e2e_multi_turn_with_memory_enrichment() {
     assert_eq!(agent.history().len(), 5);
 }
 
-/// Validates that empty memory context does not prepend memory text.
-/// A per-turn datetime prefix may still be present.
+/// Validates that empty memory context passes user message through unmodified.
 #[tokio::test]
 async fn e2e_empty_memory_context_passthrough() {
     let (provider, recorded) = RecordingProvider::new(vec![text_response("plain response")]);
@@ -647,15 +636,9 @@ async fn e2e_empty_memory_context_passthrough() {
 
     let requests = recorded.lock().unwrap();
     let user_msg = requests[0].iter().find(|m| m.role == "user").unwrap();
-    assert!(
-        user_msg.content.ends_with("hello"),
-        "User payload should preserve original text suffix, got: {}",
-        user_msg.content
-    );
-    assert!(
-        !user_msg.content.contains("[Memory context]"),
-        "Empty context should not prepend memory context text, got: {}",
-        user_msg.content
+    assert_eq!(
+        user_msg.content, "hello",
+        "Empty context should not prepend anything to user message",
     );
 }
 
@@ -674,7 +657,7 @@ async fn e2e_live_openai_codex_multi_turn() {
     use zeroclaw::providers::openai_codex::OpenAiCodexProvider;
     use zeroclaw::providers::traits::Provider;
 
-    let provider = OpenAiCodexProvider::new(&ProviderRuntimeOptions::default(), None).unwrap();
+    let provider = OpenAiCodexProvider::new(&ProviderRuntimeOptions::default());
     let model = "gpt-5.3-codex";
 
     // Turn 1: establish a fact

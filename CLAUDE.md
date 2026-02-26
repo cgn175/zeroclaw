@@ -153,13 +153,9 @@ Treat documentation as a first-class product surface, not a post-merge artifact.
 
 Canonical entry points:
 
-- root READMEs: `README.md`, `README.zh-CN.md`, `README.ja.md`, `README.ru.md`, `README.fr.md`, `README.vi.md`
-- docs hubs: `docs/README.md`, `docs/README.zh-CN.md`, `docs/README.ja.md`, `docs/README.ru.md`, `docs/README.fr.md`, `docs/i18n/vi/README.md`
+- root READMEs: `README.md`, `README.zh-CN.md`, `README.ja.md`, `README.ru.md`
+- docs hubs: `docs/README.md`, `docs/README.zh-CN.md`, `docs/README.ja.md`, `docs/README.ru.md`
 - unified TOC: `docs/SUMMARY.md`
-
-Supported locales (current contract):
-
-- `en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`
 
 Collection indexes (category navigation):
 
@@ -184,11 +180,7 @@ Runtime-contract references (must track behavior changes):
 Required docs governance rules:
 
 - Keep README/hub top navigation and quick routes intuitive and non-duplicative.
-- Keep entry-point parity across all supported locales (`en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`) when changing navigation architecture.
-- If a change touches docs IA, runtime-contract references, or user-facing wording in shared docs, perform i18n follow-through for currently supported locales in the same PR:
-  - Update locale navigation links (`README*`, `docs/README*`, `docs/SUMMARY.md`).
-  - Update localized runtime-contract docs where equivalents exist (at minimum `commands-reference`, `config-reference`, `troubleshooting` for `fr` and `vi`).
-  - For Vietnamese, treat `docs/i18n/vi/**` as canonical. Keep `docs/*.<locale>.md` compatibility shims aligned if present.
+- Keep EN/ZH/JA/RU entry-point parity when changing navigation architecture.
 - Keep proposal/roadmap docs explicitly labeled; avoid mixing proposal text into runtime-contract docs.
 - Keep project snapshots date-stamped and immutable once superseded by a newer date.
 
@@ -216,7 +208,7 @@ When uncertain, classify as higher risk.
 5. **Document impact**
     - Update docs/PR notes for behavior, risk, side effects, and rollback.
     - If CLI/config/provider/channel behavior changed, update corresponding runtime-contract references.
-    - If docs entry points changed, keep all supported locale README/docs-hub navigation aligned (`en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`).
+    - If docs entry points changed, keep EN/ZH/JA/RU README + docs-hub navigation aligned.
 6. **Respect queue hygiene**
     - If stacked PR: declare `Depends on #...`.
     - If replacing old PR: declare `Supersedes #...`.
@@ -304,8 +296,7 @@ Use these rules to keep the trait/factory architecture stable under growth.
 - Treat docs navigation as product UX: preserve clear pathing from README -> docs hub -> SUMMARY -> category index.
 - Keep top-level nav concise; avoid duplicative links across adjacent nav blocks.
 - When runtime surfaces change, update related references (`commands/providers/channels/config/runbook/troubleshooting`).
-- Keep multilingual entry-point parity for all supported locales (`en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`) when nav or key wording changes.
-- When shared docs wording changes, sync corresponding localized docs for supported locales in the same PR (or explicitly document deferral and follow-up PR).
+- Keep multilingual entry-point parity for EN/ZH/JA/RU when nav or key wording changes.
 - For docs snapshots, add new date-stamped files for new sprints rather than rewriting historical context.
 
 

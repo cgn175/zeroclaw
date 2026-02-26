@@ -3,7 +3,6 @@ pub enum MemoryBackendKind {
     Sqlite,
     Lucid,
     Postgres,
-    Qdrant,
     Markdown,
     None,
     Unknown,
@@ -53,15 +52,6 @@ const POSTGRES_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     auto_save_default: true,
     uses_sqlite_hygiene: false,
     sqlite_based: false,
-    optional_dependency: true,
-};
-
-const QDRANT_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
-    key: "qdrant",
-    label: "Qdrant — vector database for semantic search via [memory.qdrant]",
-    auto_save_default: true,
-    uses_sqlite_hygiene: false,
-    sqlite_based: false,
     optional_dependency: false,
 };
 
@@ -103,7 +93,6 @@ pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
         "sqlite" => MemoryBackendKind::Sqlite,
         "lucid" => MemoryBackendKind::Lucid,
         "postgres" => MemoryBackendKind::Postgres,
-        "qdrant" => MemoryBackendKind::Qdrant,
         "markdown" => MemoryBackendKind::Markdown,
         "none" => MemoryBackendKind::None,
         _ => MemoryBackendKind::Unknown,
@@ -115,7 +104,6 @@ pub fn memory_backend_profile(backend: &str) -> MemoryBackendProfile {
         MemoryBackendKind::Sqlite => SQLITE_PROFILE,
         MemoryBackendKind::Lucid => LUCID_PROFILE,
         MemoryBackendKind::Postgres => POSTGRES_PROFILE,
-        MemoryBackendKind::Qdrant => QDRANT_PROFILE,
         MemoryBackendKind::Markdown => MARKDOWN_PROFILE,
         MemoryBackendKind::None => NONE_PROFILE,
         MemoryBackendKind::Unknown => CUSTOM_PROFILE,

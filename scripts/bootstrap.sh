@@ -29,7 +29,7 @@ Modes:
 Options:
   --guided                   Run interactive guided installer
   --no-guided                Disable guided installer
-  --docker                   Run bootstrap in Docker-compatible mode and launch onboarding inside the container
+  --docker                   Run bootstrap in Docker and launch onboarding inside the container
   --install-system-deps      Install build dependencies (Linux/macOS)
   --install-rust             Install Rust via rustup if missing
   --prefer-prebuilt          Try latest release binary first; fallback to source build on miss
@@ -41,7 +41,7 @@ Options:
   --provider <id>            Provider for non-interactive onboarding (default: openrouter)
   --model <id>               Model for non-interactive onboarding (optional)
   --build-first              Alias for explicitly enabling separate `cargo build --release --locked`
-  --skip-build               Skip build step (`cargo build --release --locked` or Docker image build)
+  --skip-build               Skip `cargo build --release --locked`
   --skip-install             Skip `cargo install --path . --force --locked`
   -h, --help                 Show help
 
@@ -61,7 +61,6 @@ Examples:
   curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/bootstrap.sh | bash
 
 Environment:
-  ZEROCLAW_CONTAINER_CLI     Container CLI command (default: docker; auto-fallback: podman)
   ZEROCLAW_DOCKER_DATA_DIR   Host path for Docker config/workspace persistence
   ZEROCLAW_DOCKER_IMAGE      Docker image tag to build/run (default: zeroclaw-bootstrap:local)
   ZEROCLAW_API_KEY           Used when --api-key is not provided
@@ -313,45 +312,6 @@ bool_to_word() {
   fi
 }
 
-guided_input_stream() {
-  if [[ -t 0 ]]; then
-    echo "/dev/stdin"
-    return 0
-  fi
-
-  if (: </dev/tty) 2>/dev/null; then
-    echo "/dev/tty"
-    return 0
-  fi
-
-  return 1
-}
-
-guided_read() {
-  local __target_var="$1"
-  local __prompt="$2"
-  local __silent="${3:-false}"
-  local __input_source=""
-  local __value=""
-
-  if ! __input_source="$(guided_input_stream)"; then
-    return 1
-  fi
-
-  if [[ "$__silent" == true ]]; then
-    if ! read -r -s -p "$__prompt" __value <"$__input_source"; then
-      return 1
-    fi
-  else
-    if ! read -r -p "$__prompt" __value <"$__input_source"; then
-      return 1
-    fi
-  fi
-
-  printf -v "$__target_var" '%s' "$__value"
-  return 0
-}
-
 prompt_yes_no() {
   local question="$1"
   local default_answer="$2"
@@ -365,7 +325,7 @@ prompt_yes_no() {
   fi
 
   while true; do
-    if ! guided_read answer "$question $prompt "; then
+    if ! read -r -p "$question $prompt " answer; then
       error "guided installer input was interrupted."
       exit 1
     fi
@@ -477,12 +437,6 @@ run_guided_installer() {
   local model_input=""
   local api_key_input=""
 
-  if ! guided_input_stream >/dev/null; then
-    error "guided installer requires an interactive terminal."
-    error "Run from a terminal, or pass --no-guided with explicit flags."
-    exit 1
-  fi
-
   echo
   echo "ZeroClaw guided installer"
   echo "Answer a few questions, then the installer will run automatically."
@@ -524,7 +478,7 @@ run_guided_installer() {
       INTERACTIVE_ONBOARD=true
     else
       INTERACTIVE_ONBOARD=false
-      if ! guided_read provider_input "Provider [$PROVIDER]: "; then
+      if ! read -r -p "Provider [$PROVIDER]: " provider_input; then
         error "guided installer input was interrupted."
         exit 1
       fi
@@ -532,7 +486,7 @@ run_guided_installer() {
         PROVIDER="$provider_input"
       fi
 
-      if ! guided_read model_input "Model [${MODEL:-leave empty}]: "; then
+      if ! read -r -p "Model [${MODEL:-leave empty}]: " model_input; then
         error "guided installer input was interrupted."
         exit 1
       fi
@@ -541,7 +495,7 @@ run_guided_installer() {
       fi
 
       if [[ -z "$API_KEY" ]]; then
-        if ! guided_read api_key_input "API key (hidden, leave empty to switch to interactive onboarding): " true; then
+        if ! read -r -s -p "API key (hidden, leave empty to switch to interactive onboarding): " api_key_input; then
           echo
           error "guided installer input was interrupted."
           exit 1
@@ -590,46 +544,26 @@ run_guided_installer() {
   fi
 }
 
-resolve_container_cli() {
-  local requested_cli
-  requested_cli="${ZEROCLAW_CONTAINER_CLI:-docker}"
-
-  if have_cmd "$requested_cli"; then
-    CONTAINER_CLI="$requested_cli"
-    return 0
-  fi
-
-  if [[ "$requested_cli" == "docker" ]] && have_cmd podman; then
-    warn "docker CLI not found; falling back to podman."
-    CONTAINER_CLI="podman"
-    return 0
-  fi
-
-  error "Container CLI '$requested_cli' is not installed."
-  if [[ "$requested_cli" != "docker" ]]; then
-    error "Set ZEROCLAW_CONTAINER_CLI to an installed Docker-compatible CLI (e.g., docker or podman)."
-  else
-    error "Install Docker, install podman, or set ZEROCLAW_CONTAINER_CLI to an available Docker-compatible CLI."
-  fi
-  exit 1
-}
-
 ensure_docker_ready() {
-  resolve_container_cli
+  if ! have_cmd docker; then
+    error "docker is not installed."
+    cat <<'MSG' >&2
+Install Docker first, then re-run with:
+  ./zeroclaw_install.sh --docker
+MSG
+    exit 1
+  fi
 
-  if ! "$CONTAINER_CLI" info >/dev/null 2>&1; then
-    error "Container runtime is not reachable via '$CONTAINER_CLI'."
-    error "Start the container runtime and re-run bootstrap."
+  if ! docker info >/dev/null 2>&1; then
+    error "Docker daemon is not reachable."
+    error "Start Docker and re-run bootstrap."
     exit 1
   fi
 }
 
 run_docker_bootstrap() {
-  local docker_image docker_data_dir default_data_dir fallback_image
-  local config_mount workspace_mount
-  local -a container_run_user_args container_run_namespace_args
+  local docker_image docker_data_dir default_data_dir
   docker_image="${ZEROCLAW_DOCKER_IMAGE:-zeroclaw-bootstrap:local}"
-  fallback_image="ghcr.io/zeroclaw-labs/zeroclaw:latest"
   if [[ "$TEMP_CLONE" == true ]]; then
     default_data_dir="$HOME/.zeroclaw-docker"
   else
@@ -646,38 +580,12 @@ run_docker_bootstrap() {
 
   if [[ "$SKIP_BUILD" == false ]]; then
     info "Building Docker image ($docker_image)"
-    "$CONTAINER_CLI" build --target release -t "$docker_image" "$WORK_DIR"
+    docker build --target release -t "$docker_image" "$WORK_DIR"
   else
     info "Skipping Docker image build"
-    if ! "$CONTAINER_CLI" image inspect "$docker_image" >/dev/null 2>&1; then
-      warn "Local Docker image ($docker_image) was not found."
-      info "Pulling official ZeroClaw image ($fallback_image)"
-      if ! "$CONTAINER_CLI" pull "$fallback_image"; then
-        error "Failed to pull fallback Docker image: $fallback_image"
-        error "Run without --skip-build to build locally, or verify access to GHCR."
-        exit 1
-      fi
-      if [[ "$docker_image" != "$fallback_image" ]]; then
-        info "Tagging fallback image as $docker_image"
-        "$CONTAINER_CLI" tag "$fallback_image" "$docker_image"
-      fi
-    fi
-  fi
-
-  config_mount="$docker_data_dir/.zeroclaw:/zeroclaw-data/.zeroclaw"
-  workspace_mount="$docker_data_dir/workspace:/zeroclaw-data/workspace"
-  if [[ "$CONTAINER_CLI" == "podman" ]]; then
-    config_mount+=":Z"
-    workspace_mount+=":Z"
-    container_run_namespace_args=(--userns keep-id)
-    container_run_user_args=(--user "$(id -u):$(id -g)")
-  else
-    container_run_namespace_args=()
-    container_run_user_args=(--user "$(id -u):$(id -g)")
   fi
 
   info "Docker data directory: $docker_data_dir"
-  info "Container CLI: $CONTAINER_CLI"
 
   local onboard_cmd=()
   if [[ "$INTERACTIVE_ONBOARD" == true ]]; then
@@ -707,13 +615,12 @@ MSG
     fi
   fi
 
-  "$CONTAINER_CLI" run --rm -it \
-    "${container_run_namespace_args[@]}" \
-    "${container_run_user_args[@]}" \
+  docker run --rm -it \
+    --user "$(id -u):$(id -g)" \
     -e HOME=/zeroclaw-data \
     -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
-    -v "$config_mount" \
-    -v "$workspace_mount" \
+    -v "$docker_data_dir/.zeroclaw:/zeroclaw-data/.zeroclaw" \
+    -v "$docker_data_dir/workspace:/zeroclaw-data/workspace" \
     "$docker_image" \
     "${onboard_cmd[@]}"
 }
@@ -736,7 +643,6 @@ INTERACTIVE_ONBOARD=false
 SKIP_BUILD=false
 SKIP_INSTALL=false
 PREBUILT_INSTALLED=false
-CONTAINER_CLI="${ZEROCLAW_CONTAINER_CLI:-docker}"
 API_KEY="${ZEROCLAW_API_KEY:-}"
 PROVIDER="${ZEROCLAW_PROVIDER:-openrouter}"
 MODEL="${ZEROCLAW_MODEL:-}"

@@ -10,7 +10,7 @@ module.exports = async ({ github, context, core }) => {
       return;
     }
 
-    const baseOwners = ["theonlyhennygod", "willsarg", "chumyin"];
+    const baseOwners = ["theonlyhennygod", "willsarg"];
     const configuredOwners = (process.env.WORKFLOW_OWNER_LOGINS || "")
       .split(",")
       .map((login) => login.trim().toLowerCase())

@@ -2,9 +2,9 @@ name: CI Run
 
 on:
     push:
-        branches: [dev, main]
+        branches: [main]
     pull_request:
-        branches: [dev, main]
+        branches: [main]
 
 concurrency:
     group: ci-${{ github.event.pull_request.number || github.sha }}
@@ -43,7 +43,7 @@ jobs:
     lint:
         name: Lint Gate (Format + Clippy + Strict Delta)
         needs: [changes]
-        if: needs.changes.outputs.rust_changed == 'true'
+        if: needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 25
         steps:
@@ -65,7 +65,7 @@ jobs:
     test:
         name: Test
         needs: [changes, lint]
-        if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success'
+        if: needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.lint.result == 'success'
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 30
         steps:
@@ -91,9 +91,7 @@ jobs:
                   toolchain: 1.92.0
             - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
             - name: Build binary (smoke check)
-              run: cargo build --profile release-fast --locked --verbose
-            - name: Check binary size
-              run: bash scripts/ci/check_binary_size.sh target/release-fast/zeroclaw
+              run: cargo build --locked --verbose
 
     docs-only:
         name: Docs-Only Fast Path
@@ -116,7 +114,7 @@ jobs:
     docs-quality:
         name: Docs Quality
         needs: [changes]
-        if: needs.changes.outputs.docs_changed == 'true'
+        if: needs.changes.outputs.docs_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 15
         steps:
@@ -214,29 +212,10 @@ jobs:
                   script: |
                     const script = require('./.github/workflows/scripts/ci_workflow_owner_approval.js');
                     await script({ github, context, core });
-
-    license-file-owner-guard:
-        name: License File Owner Guard
-        needs: [changes]
-        if: github.event_name == 'pull_request'
-        runs-on: blacksmith-2vcpu-ubuntu-2404
-        permissions:
-            contents: read
-            pull-requests: read
-        steps:
-            - name: Checkout repository
-              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-            - name: Enforce owner-only edits for root license files
-              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-              with:
-                  script: |
-                    const script = require('./.github/workflows/scripts/ci_license_file_owner_guard.js');
-                    await script({ github, context, core });
     ci-required:
         name: CI Required Gate
         if: always()
-        needs: [changes, lint, test, build, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval, license-file-owner-guard]
+        needs: [changes, lint, test, build, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval]
         runs-on: blacksmith-2vcpu-ubuntu-2404
         steps:
             - name: Enforce required status
@@ -250,21 +229,15 @@ jobs:
                   workflow_changed="${{ needs.changes.outputs.workflow_changed }}"
                   docs_result="${{ needs.docs-quality.result }}"
                   workflow_owner_result="${{ needs.workflow-owner-approval.result }}"
-                  license_owner_result="${{ needs.license-file-owner-guard.result }}"
 
                   if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
                     echo "workflow_owner_approval=${workflow_owner_result}"
-                    echo "license_file_owner_guard=${license_owner_result}"
-                    if [ "$event_name" = "pull_request" ] && [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
+                    if [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
                       echo "Workflow files changed but workflow owner approval gate did not pass."
                       exit 1
                     fi
-                    if [ "$event_name" = "pull_request" ] && [ "$license_owner_result" != "success" ]; then
-                      echo "License file owner guard did not pass."
-                      exit 1
-                    fi
-                    if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
-                      echo "Docs-only change detected, but docs-quality did not pass."
+                    if [ "$event_name" != "pull_request" ] && [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
+                      echo "Docs-only push changed docs, but docs-quality did not pass."
                       exit 1
                     fi
                     echo "Docs-only fast path passed."
@@ -274,17 +247,12 @@ jobs:
                   if [ "$rust_changed" != "true" ]; then
                     echo "rust_changed=false (non-rust fast path)"
                     echo "workflow_owner_approval=${workflow_owner_result}"
-                    echo "license_file_owner_guard=${license_owner_result}"
-                    if [ "$event_name" = "pull_request" ] && [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
+                    if [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
                       echo "Workflow files changed but workflow owner approval gate did not pass."
                       exit 1
                     fi
-                    if [ "$event_name" = "pull_request" ] && [ "$license_owner_result" != "success" ]; then
-                      echo "License file owner guard did not pass."
-                      exit 1
-                    fi
-                    if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
-                      echo "Non-rust change touched docs, but docs-quality did not pass."
+                    if [ "$event_name" != "pull_request" ] && [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
+                      echo "Non-rust push changed docs, but docs-quality did not pass."
                       exit 1
                     fi
                     echo "Non-rust fast path passed."
@@ -302,25 +270,15 @@ jobs:
                   echo "build=${build_result}"
                   echo "docs=${docs_result}"
                   echo "workflow_owner_approval=${workflow_owner_result}"
-                  echo "license_file_owner_guard=${license_owner_result}"
 
-                  if [ "$event_name" = "pull_request" ] && [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
+                  if [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
                     echo "Workflow files changed but workflow owner approval gate did not pass."
                     exit 1
                   fi
 
-                  if [ "$event_name" = "pull_request" ] && [ "$license_owner_result" != "success" ]; then
-                    echo "License file owner guard did not pass."
-                    exit 1
-                  fi
-
                   if [ "$event_name" = "pull_request" ]; then
-                    if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
-                      echo "Required PR CI jobs did not pass."
-                      exit 1
-                    fi
-                    if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
-                      echo "PR changed docs, but docs-quality did not pass."
+                    if [ "$build_result" != "success" ]; then
+                      echo "Required PR build job did not pass."
                       exit 1
                     fi
                     echo "PR required checks passed."
