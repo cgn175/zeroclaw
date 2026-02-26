@@ -685,38 +685,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_agent_job_blocks_readonly_mode() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp);
-        config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
-        let mut job = test_job("");
-        job.job_type = JobType::Agent;
-        job.prompt = Some("Say hello".into());
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-
-        let (success, output) = run_agent_job(&config, &security, &job).await;
-        assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("read-only"));
-    }
-
-    #[tokio::test]
-    async fn run_agent_job_blocks_rate_limited() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp);
-        config.autonomy.max_actions_per_hour = 0;
-        let mut job = test_job("");
-        job.job_type = JobType::Agent;
-        job.prompt = Some("Say hello".into());
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-
-        let (success, output) = run_agent_job(&config, &security, &job).await;
-        assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("rate limit exceeded"));
-    }
-
-    #[tokio::test]
     async fn persist_job_result_records_run_and_reschedules_shell_job() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;

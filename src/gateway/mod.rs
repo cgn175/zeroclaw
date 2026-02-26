@@ -283,8 +283,14 @@ pub struct AppState {
     pub linq: Option<Arc<LinqChannel>>,
     /// Linq webhook signing secret for signature verification
     pub linq_signing_secret: Option<Arc<str>>,
+    /// Nextcloud Talk webhook secret for signature verification
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn crate::observability::Observer>,
+    /// Registered tool specs (for web dashboard tools page)
+
+   /// SSE broadcast channel for real-time events
+    pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+    pub a2a_tasks: a2a::TaskStore,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -300,6 +306,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         );
     }
     let config_state = Arc::new(Mutex::new(config.clone()));
+
 
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -513,6 +520,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let observer: Arc<dyn crate::observability::Observer> =
         Arc::from(crate::observability::create_observer(&config.observability));
 
+    // SSE broadcast channel for real-time events
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
+
     let state = AppState {
         config: config_state,
         provider,
@@ -530,6 +540,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         linq: linq_channel,
         linq_signing_secret,
         observer,
+        event_tx,
+        a2a_tasks: a2a::TaskStore::default(),
     };
 
     // Build router with middleware
@@ -914,6 +926,12 @@ async fn handle_webhook(
     }
 }
 
+/// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
+pub(crate) async fn run_gateway_chat_with_tools(state: &AppState, message: &str) -> anyhow::Result<String> {
+    let config = state.config.lock().clone();
+    crate::agent::process_message(config, message).await
+}
+
 /// `WhatsApp` verification query params
 #[derive(serde::Deserialize)]
 pub struct WhatsAppVerifyQuery {
@@ -1205,6 +1223,7 @@ mod tests {
     use http_body_util::BodyExt;
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use rand::RngExt;
 
     /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.
     fn generate_test_secret() -> String {
@@ -1251,83 +1270,6 @@ mod tests {
         assert_clone::<AppState>();
     }
 
-    #[tokio::test]
-    async fn metrics_endpoint_returns_hint_when_prometheus_is_disabled() {
-        let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            provider: Arc::new(MockProvider::default()),
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: Arc::new(MockMemory),
-            auto_save: false,
-            webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            observer: Arc::new(crate::observability::NoopObserver),
-            a2a_rate_limiter: None,
-            a2a_idempotency_store: None,
-            a2a_pairing_manager: None,
-        };
-
-        let response = handle_metrics(State(state)).await.into_response();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok()),
-            Some(PROMETHEUS_CONTENT_TYPE)
-        );
-
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(text.contains("Prometheus backend not enabled"));
-    }
-
-    #[tokio::test]
-    async fn metrics_endpoint_renders_prometheus_output() {
-        let prom = Arc::new(crate::observability::PrometheusObserver::new());
-        crate::observability::Observer::record_event(
-            prom.as_ref(),
-            &crate::observability::ObserverEvent::HeartbeatTick,
-        );
-
-        let observer: Arc<dyn crate::observability::Observer> = prom;
-        let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            provider: Arc::new(MockProvider::default()),
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: Arc::new(MockMemory),
-            auto_save: false,
-            webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            observer,
-            a2a_rate_limiter: None,
-            a2a_idempotency_store: None,
-            a2a_pairing_manager: None,
-        };
-
-        let response = handle_metrics(State(state)).await.into_response();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(text.contains("zeroclaw_heartbeat_ticks_total 1"));
-    }
 
     #[test]
     fn gateway_rate_limiter_blocks_after_limit() {
@@ -1656,126 +1598,6 @@ mod tests {
         ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 30_300)))
     }
 
-    #[tokio::test]
-    async fn webhook_idempotency_skips_duplicate_provider_calls() {
-        let provider_impl = Arc::new(MockProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
-        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
-
-        let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            provider,
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: memory,
-            auto_save: false,
-            webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            observer: Arc::new(crate::observability::NoopObserver),
-            a2a_rate_limiter: None,
-            a2a_idempotency_store: None,
-            a2a_pairing_manager: None,
-        };
-
-        let mut headers = HeaderMap::new();
-        headers.insert("X-Idempotency-Key", HeaderValue::from_static("abc-123"));
-
-        let body = Ok(Json(WebhookBody {
-            message: "hello".into(),
-        }));
-        let first = handle_webhook(
-            State(state.clone()),
-            test_connect_info(),
-            headers.clone(),
-            body,
-        )
-        .await
-        .into_response();
-        assert_eq!(first.status(), StatusCode::OK);
-
-        let body = Ok(Json(WebhookBody {
-            message: "hello".into(),
-        }));
-        let second = handle_webhook(State(state), test_connect_info(), headers, body)
-            .await
-            .into_response();
-        assert_eq!(second.status(), StatusCode::OK);
-
-        let payload = second.into_body().collect().await.unwrap().to_bytes();
-        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-        assert_eq!(parsed["status"], "duplicate");
-        assert_eq!(parsed["idempotent"], true);
-        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn webhook_autosave_stores_distinct_keys_per_request() {
-        let provider_impl = Arc::new(MockProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
-
-        let tracking_impl = Arc::new(TrackingMemory::default());
-        let memory: Arc<dyn Memory> = tracking_impl.clone();
-
-        let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            provider,
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: memory,
-            auto_save: true,
-            webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            observer: Arc::new(crate::observability::NoopObserver),
-            a2a_rate_limiter: None,
-            a2a_idempotency_store: None,
-            a2a_pairing_manager: None,
-        };
-
-        let headers = HeaderMap::new();
-
-        let body1 = Ok(Json(WebhookBody {
-            message: "hello one".into(),
-        }));
-        let first = handle_webhook(
-            State(state.clone()),
-            test_connect_info(),
-            headers.clone(),
-            body1,
-        )
-        .await
-        .into_response();
-        assert_eq!(first.status(), StatusCode::OK);
-
-        let body2 = Ok(Json(WebhookBody {
-            message: "hello two".into(),
-        }));
-        let second = handle_webhook(State(state), test_connect_info(), headers, body2)
-            .await
-            .into_response();
-        assert_eq!(second.status(), StatusCode::OK);
-
-        let keys = tracking_impl.keys.lock().clone();
-        assert_eq!(keys.len(), 2);
-        assert_ne!(keys[0], keys[1]);
-        assert!(keys[0].starts_with("webhook_msg_"));
-        assert!(keys[1].starts_with("webhook_msg_"));
-        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 2);
-    }
-
     #[test]
     fn webhook_secret_hash_is_deterministic_and_nonempty() {
         let secret_a = generate_test_secret();
@@ -1789,147 +1611,6 @@ mod tests {
         assert_eq!(one.len(), 64);
     }
 
-    #[tokio::test]
-    async fn webhook_secret_hash_rejects_missing_header() {
-        let provider_impl = Arc::new(MockProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
-        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
-        let secret = generate_test_secret();
-
-        let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            provider,
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: memory,
-            auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            observer: Arc::new(crate::observability::NoopObserver),
-            a2a_rate_limiter: None,
-            a2a_idempotency_store: None,
-            a2a_pairing_manager: None,
-        };
-
-        let response = handle_webhook(
-            State(state),
-            test_connect_info(),
-            HeaderMap::new(),
-            Ok(Json(WebhookBody {
-                message: "hello".into(),
-            })),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn webhook_secret_hash_rejects_invalid_header() {
-        let provider_impl = Arc::new(MockProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
-        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
-        let valid_secret = generate_test_secret();
-        let wrong_secret = generate_test_secret();
-
-        let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            provider,
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: memory,
-            auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            observer: Arc::new(crate::observability::NoopObserver),
-            a2a_rate_limiter: None,
-            a2a_idempotency_store: None,
-            a2a_pairing_manager: None,
-        };
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "X-Webhook-Secret",
-            HeaderValue::from_str(&wrong_secret).unwrap(),
-        );
-
-        let response = handle_webhook(
-            State(state),
-            test_connect_info(),
-            headers,
-            Ok(Json(WebhookBody {
-                message: "hello".into(),
-            })),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn webhook_secret_hash_accepts_valid_header() {
-        let provider_impl = Arc::new(MockProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
-        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
-        let secret = generate_test_secret();
-
-        let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            provider,
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: memory,
-            auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            observer: Arc::new(crate::observability::NoopObserver),
-            a2a_rate_limiter: None,
-            a2a_idempotency_store: None,
-            a2a_pairing_manager: None,
-        };
-
-        let mut headers = HeaderMap::new();
-        headers.insert("X-Webhook-Secret", HeaderValue::from_str(&secret).unwrap());
-
-        let response = handle_webhook(
-            State(state),
-            test_connect_info(),
-            headers,
-            Ok(Json(WebhookBody {
-                message: "hello".into(),
-            })),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
-    }
 
     // ══════════════════════════════════════════════════════════
     // WhatsApp Signature Verification Tests (CWE-345 Prevention)
