@@ -9,7 +9,6 @@
 
 pub mod a2a;
 
-use crate::channels::{Channel, LinqChannel, SendMessage, WhatsAppChannel};
 pub mod api;
 pub mod sse;
 pub mod static_files;
@@ -313,6 +312,7 @@ pub struct AppState {
     pub cost_tracker: Option<Arc<CostTracker>>,
     /// SSE broadcast channel for real-time events
     pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+    pub a2a_tasks: a2a::TaskStore,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -656,6 +656,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         tools_registry,
         cost_tracker,
         event_tx,
+        a2a_tasks: a2a::TaskStore::default(),
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -877,7 +878,7 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
 }
 
 /// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
-async fn run_gateway_chat_with_tools(state: &AppState, message: &str) -> anyhow::Result<String> {
+pub(crate) async fn run_gateway_chat_with_tools(state: &AppState, message: &str) -> anyhow::Result<String> {
     let config = state.config.lock().clone();
     crate::agent::process_message(config, message).await
 }
@@ -1617,6 +1618,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            a2a_tasks: a2a::TaskStore::default(),
             a2a_rate_limiter: None,
             a2a_idempotency_store: None,
             a2a_pairing_manager: None,
@@ -1672,6 +1674,7 @@ mod tests {
             ols_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            a2a_tasks: a2a::TaskStore::default(),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2038,6 +2041,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            a2a_tasks: a2a::TaskStore::default(),
             a2a_rate_limiter: None,
             a2a_idempotency_store: None,
             a2a_pairing_manager: None,
@@ -2105,6 +2109,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            a2a_tasks: a2a::TaskStore::default(),
             a2a_rate_limiter: None,
             a2a_idempotency_store: None,
             a2a_pairing_manager: None,
@@ -2184,6 +2189,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            a2a_tasks: a2a::TaskStore::default(),
             a2a_rate_limiter: None,
             a2a_idempotency_store: None,
             a2a_pairing_manager: None,
@@ -2235,6 +2241,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            a2a_tasks: a2a::TaskStore::default(),
             a2a_rate_limiter: None,
             a2a_idempotency_store: None,
             a2a_pairing_manager: None,
@@ -2294,6 +2301,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            a2a_tasks: a2a::TaskStore::default(),
         };
 
         let mut headers = HeaderMap::new();
@@ -2352,6 +2360,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            a2a_tasks: a2a::TaskStore::default(),
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2406,6 +2415,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            a2a_tasks: a2a::TaskStore::default(),
         };
 
         let mut headers = HeaderMap::new();

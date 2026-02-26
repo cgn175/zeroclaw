@@ -1,33 +1,95 @@
 //! A2A (Agent-to-Agent) Protocol Gateway Endpoints
 //!
-//! This module implements the Google A2A Protocol standard for agent-to-agent communication.
+//! Implements the Google A2A Protocol for agent-to-agent communication.
 //!
-//! # Google A2A Protocol Endpoints
+//! # Endpoints
 //!
 //! - `GET /.well-known/agent.json` - Agent discovery (AgentCard)
-//! - `POST /tasks` - Create a new task
+//! - `POST /tasks` - Create a new task (dispatches to agent, returns immediately)
 //! - `GET /tasks/{id}` - Get task status and result
-//! - `GET /tasks/{id}/stream` - SSE stream for task updates
+//! - `GET /tasks/{id}/stream` - SSE stream for real-time task updates
 //! - `POST /tasks/{id}/cancel` - Cancel a running task
-//!
-//! # Security Model
-//!
-//! - Bearer token authentication for all task endpoints
-//! - Peer allowlist controls which agents can communicate
-//! - Deny-by-default for unknown peers
-//! - TLS recommended for production deployments
 
 use crate::channels::a2a::protocol::{
     AgentCapabilities, AgentCard, AgentEndpoints, AuthenticationInfo, CancelTaskRequest,
-    CreateTaskResponse, Task,
+    CreateTaskResponse, Task, TaskMessage, TaskStatus, TaskUpdate,
 };
 use crate::config::schema::A2AConfig;
 use crate::gateway::AppState;
 use axum::{
     extract::{Path, State},
     http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Json},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Json,
+    },
 };
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::sync::Arc;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt;
+
+// =============================================================================
+// Task Store
+// =============================================================================
+
+/// A stored task entry with broadcast channel for SSE streaming.
+pub struct TaskEntry {
+    pub task: Task,
+    pub update_tx: tokio::sync::broadcast::Sender<TaskUpdate>,
+    pub join_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Shared task store for A2A tasks.
+#[derive(Clone, Default)]
+pub struct TaskStore(Arc<Mutex<HashMap<String, TaskEntry>>>);
+
+impl TaskStore {
+    pub fn insert(&self, id: String, entry: TaskEntry) {
+        self.0.lock().insert(id, entry);
+    }
+
+    pub fn get_task(&self, id: &str) -> Option<Task> {
+        self.0.lock().get(id).map(|e| e.task.clone())
+    }
+
+    pub fn subscribe(
+        &self,
+        id: &str,
+    ) -> Option<(Task, tokio::sync::broadcast::Receiver<TaskUpdate>)> {
+        let store = self.0.lock();
+        store.get(id).map(|e| (e.task.clone(), e.update_tx.subscribe()))
+    }
+
+    pub fn update_task(&self, id: &str, f: impl FnOnce(&mut Task)) {
+        if let Some(entry) = self.0.lock().get_mut(id) {
+            f(&mut entry.task);
+        }
+    }
+
+    pub fn cancel(&self, id: &str) -> Option<TaskUpdate> {
+        let mut store = self.0.lock();
+        let entry = store.get_mut(id)?;
+        match entry.task.status {
+            TaskStatus::Pending | TaskStatus::Running => {
+                entry.task.set_status(TaskStatus::Cancelled);
+                if let Some(handle) = entry.join_handle.take() {
+                    handle.abort();
+                }
+                let update = TaskUpdate::status_update(id, TaskStatus::Cancelled);
+                let _ = entry.update_tx.send(update.clone());
+                Some(update)
+            }
+            _ => None, // Already in terminal state
+        }
+    }
+}
+
+// =============================================================================
+// Handlers
+// =============================================================================
 
 /// GET /.well-known/agent.json - Agent discovery endpoint.
 pub async fn handle_agent_card(State(state): State<AppState>) -> impl IntoResponse {
@@ -66,7 +128,7 @@ pub async fn handle_agent_card(State(state): State<AppState>) -> impl IntoRespon
     Json(card)
 }
 
-/// POST /tasks - Create a new task.
+/// POST /tasks - Create a new task and dispatch to agent.
 pub async fn handle_create_task(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -107,12 +169,64 @@ pub async fn handle_create_task(
 
     let task_id = uuid::Uuid::new_v4().to_string();
     let mut task = Task::new(&task_id);
-    task.add_message(request.message);
+    task.add_message(request.message.clone());
 
-    tracing::info!("A2A task created: {} by peer {}", task_id, peer_id);
+    let (update_tx, _) = tokio::sync::broadcast::channel::<TaskUpdate>(64);
+
+    // Clone what we need for the background task
+    let bg_state = state.clone();
+    let bg_task_id = task_id.clone();
+    let bg_update_tx = update_tx.clone();
+    let message_content = request.message.content.clone();
+
+    let join_handle = tokio::spawn(async move {
+        // Mark as running
+        bg_state.a2a_tasks.update_task(&bg_task_id, |t| {
+            t.set_status(TaskStatus::Running);
+        });
+        let _ = bg_update_tx.send(TaskUpdate::status_update(&bg_task_id, TaskStatus::Running));
+
+        // Run the agent loop
+        match crate::gateway::run_gateway_chat_with_tools(&bg_state, &message_content).await {
+            Ok(response) => {
+                let agent_msg = TaskMessage::agent(&response);
+                bg_state.a2a_tasks.update_task(&bg_task_id, |t| {
+                    t.add_message(agent_msg.clone());
+                    t.set_status(TaskStatus::Completed);
+                });
+                let _ =
+                    bg_update_tx.send(TaskUpdate::message_update(&bg_task_id, agent_msg));
+                let _ = bg_update_tx
+                    .send(TaskUpdate::status_update(&bg_task_id, TaskStatus::Completed));
+            }
+            Err(e) => {
+                let error_msg = TaskMessage::agent(format!("Error: {e}"));
+                bg_state.a2a_tasks.update_task(&bg_task_id, |t| {
+                    t.add_message(error_msg.clone());
+                    t.set_status(TaskStatus::Failed);
+                });
+                let _ =
+                    bg_update_tx.send(TaskUpdate::message_update(&bg_task_id, error_msg));
+                let _ = bg_update_tx
+                    .send(TaskUpdate::status_update(&bg_task_id, TaskStatus::Failed));
+            }
+        }
+    });
+
+    let entry = TaskEntry {
+        task: task.clone(),
+        update_tx,
+        join_handle: Some(join_handle),
+    };
+    state.a2a_tasks.insert(task_id.clone(), entry);
+
+    tracing::info!(
+        "A2A task created and dispatched: {} by peer {}",
+        task_id,
+        peer_id
+    );
 
     let response = CreateTaskResponse { task };
-
     (
         StatusCode::CREATED,
         Json(serde_json::to_value(response).unwrap()),
@@ -135,20 +249,99 @@ pub async fn handle_get_task(
         }
     };
 
-    match verify_bearer_token(&headers, &a2a_config) {
-        Ok(_) => {}
-        Err(status) => {
-            return (status, Json(serde_json::json!({"error": "Unauthorized"})));
+    if let Err(status) = verify_bearer_token(&headers, &a2a_config) {
+        return (status, Json(serde_json::json!({"error": "Unauthorized"})));
+    }
+
+    match state.a2a_tasks.get_task(&task_id) {
+        Some(task) => (StatusCode::OK, Json(serde_json::to_value(task).unwrap())),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "Task not found",
+                "task_id": task_id
+            })),
+        ),
+    }
+}
+
+/// GET /tasks/{id}/stream - SSE stream for task updates.
+pub async fn handle_task_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+) -> impl IntoResponse {
+    let a2a_config = match &state.config.lock().channels_config.a2a {
+        Some(config) if config.enabled => config.clone(),
+        _ => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "A2A channel not enabled"})),
+            )
+                .into_response();
         }
     };
 
-    (
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({
-            "error": "Task not found",
-            "task_id": task_id
-        })),
-    )
+    if let Err(status) = verify_bearer_token(&headers, &a2a_config) {
+        return (status, Json(serde_json::json!({"error": "Unauthorized"}))).into_response();
+    }
+
+    let (current_task, rx) = match state.a2a_tasks.subscribe(&task_id) {
+        Some(pair) => pair,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "Task not found",
+                    "task_id": task_id
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Build SSE stream: first emit current state, then stream updates
+    let initial_event = TaskUpdate::status_update(&task_id, current_task.status.clone());
+    let initial = tokio_stream::once(Ok::<_, Infallible>(
+        Event::default()
+            .event("status")
+            .data(serde_json::to_string(&initial_event).unwrap()),
+    ));
+
+    let is_terminal = matches!(
+        current_task.status,
+        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+    );
+
+    if is_terminal {
+        // Task already done — send current state and close
+        return Sse::new(initial)
+            .keep_alive(KeepAlive::default())
+            .into_response();
+    }
+
+    // Stream live updates until the broadcast sender is dropped (background task completes)
+    let updates = BroadcastStream::new(rx).filter_map(|result| match result {
+        Ok(update) => {
+            let event_type = if update.message.is_some() {
+                "message"
+            } else {
+                "status"
+            };
+            Some(Ok::<_, Infallible>(
+                Event::default()
+                    .event(event_type)
+                    .data(serde_json::to_string(&update).unwrap()),
+            ))
+        }
+        Err(_) => None,
+    });
+
+    let stream = initial.chain(updates);
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// POST /tasks/{id}/cancel - Cancel a task.
@@ -168,62 +361,42 @@ pub async fn handle_cancel_task(
         }
     };
 
-    match verify_bearer_token(&headers, &a2a_config) {
-        Ok(_) => {}
-        Err(status) => {
-            return (status, Json(serde_json::json!({"error": "Unauthorized"})));
-        }
-    };
-
-    (
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({
-            "error": "Task not found",
-            "task_id": task_id
-        })),
-    )
-}
-
-/// GET /tasks/{id}/stream - SSE stream for task updates.
-pub async fn handle_task_stream(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(task_id): Path<String>,
-) -> impl IntoResponse {
-    let a2a_config = match &state.config.lock().channels_config.a2a {
-        Some(config) if config.enabled => config.clone(),
-        _ => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "A2A channel not enabled"})),
-            );
-        }
-    };
-
-    match verify_bearer_token(&headers, &a2a_config) {
-        Ok(_) => {}
-        Err(status) => {
-            return (status, Json(serde_json::json!({"error": "Unauthorized"})));
-        }
-    };
-
-    if task_id.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Task ID cannot be empty"})),
-        );
+    if let Err(status) = verify_bearer_token(&headers, &a2a_config) {
+        return (status, Json(serde_json::json!({"error": "Unauthorized"})));
     }
 
-    tracing::debug!("A2A task stream requested for task: {}", task_id);
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "task_id": task_id,
-            "status": "pending",
-            "message": "Streaming not yet implemented"
-        })),
-    )
+    match state.a2a_tasks.cancel(&task_id) {
+        Some(_) => {
+            tracing::info!("A2A task cancelled: {}", task_id);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "task_id": task_id,
+                    "status": "cancelled"
+                })),
+            )
+        }
+        None => {
+            // Check if task exists but is already terminal
+            match state.a2a_tasks.get_task(&task_id) {
+                Some(task) => (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "Task already in terminal state",
+                        "task_id": task_id,
+                        "status": task.status
+                    })),
+                ),
+                None => (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "Task not found",
+                        "task_id": task_id
+                    })),
+                ),
+            }
+        }
+    }
 }
 
 // =============================================================================
