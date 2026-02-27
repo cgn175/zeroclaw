@@ -2,7 +2,7 @@
 //!
 //! Tests for the Google A2A standard implementation types and structures.
 
-use zeroclaw::channels::a2a::protocol::{
+use zeroclaw_a2a::protocol::{
     AgentCard, AgentCapabilities, AuthenticationInfo, CreateTaskRequest, MessageRole, Task,
     TaskMessage, TaskStatus, TaskUpdate,
 };

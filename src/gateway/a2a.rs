@@ -488,9 +488,9 @@ mod tests {
                     enabled: false,
                 },
             ],
-            rate_limit: crate::config::schema::A2ARateLimitConfig::default(),
-            idempotency: crate::config::schema::A2AIdempotencyConfig::default(),
-            reconnect: crate::config::schema::A2AReconnectConfig::default(),
+            rate_limit: zeroclaw_a2a::A2ARateLimitConfig::default(),
+            idempotency: zeroclaw_a2a::A2AIdempotencyConfig::default(),
+            reconnect: zeroclaw_a2a::A2AReconnectConfig::default(),
             agent_card: None,
         }
     }

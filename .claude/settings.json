@@ -1,7 +1,5 @@
 {
   "permissions": {
-    "allow": [
-      "Bash, beads, git, edit"
-    ]
+    "allow": []
   }
 }
