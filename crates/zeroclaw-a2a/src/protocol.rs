@@ -504,6 +504,50 @@ impl Default for A2AIdempotencyConfig {
     }
 }
 
+/// A2A reconnection configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct A2AReconnectConfig {
+    /// Initial retry delay in seconds. Default: 2.
+    #[serde(default = "default_reconnect_initial_delay")]
+    pub initial_delay_secs: u64,
+    /// Maximum retry delay in seconds. Default: 60.
+    #[serde(default = "default_reconnect_max_delay")]
+    pub max_delay_secs: u64,
+    /// Maximum number of retries before marking peer as Failed. Default: 10.
+    #[serde(default = "default_reconnect_max_retries")]
+    pub max_retries: u32,
+    /// Health check recovery interval in seconds. Default: 30.
+    #[serde(default = "default_health_check_interval")]
+    pub health_check_interval_secs: u64,
+}
+
+impl Default for A2AReconnectConfig {
+    fn default() -> Self {
+        Self {
+            initial_delay_secs: 2,
+            max_delay_secs: 60,
+            max_retries: 10,
+            health_check_interval_secs: 30,
+        }
+    }
+}
+
+fn default_reconnect_initial_delay() -> u64 {
+    2
+}
+
+fn default_reconnect_max_delay() -> u64 {
+    60
+}
+
+fn default_reconnect_max_retries() -> u32 {
+    10
+}
+
+fn default_health_check_interval() -> u64 {
+    30
+}
+
 /// A2A channel configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct A2AConfig {
@@ -528,6 +572,9 @@ pub struct A2AConfig {
     /// Idempotency configuration.
     #[serde(default)]
     pub idempotency: A2AIdempotencyConfig,
+    /// Reconnection configuration.
+    #[serde(default)]
+    pub reconnect: A2AReconnectConfig,
     /// Agent card configuration.
     #[serde(default)]
     pub agent_card: Option<AgentCardConfig>,
@@ -556,6 +603,7 @@ impl Default for A2AConfig {
             peers: Vec::new(),
             rate_limit: A2ARateLimitConfig::default(),
             idempotency: A2AIdempotencyConfig::default(),
+            reconnect: A2AReconnectConfig::default(),
             agent_card: None,
         }
     }

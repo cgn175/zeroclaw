@@ -2750,10 +2750,7 @@ pub struct QQConfig {
 }
 
 // A2A configuration types re-exported from zeroclaw-a2a crate
-pub use zeroclaw_a2a::protocol::{
-    A2AConfig, A2AIdempotencyConfig, A2APeer as A2APeerConfig, A2ARateLimitConfig,
-    A2AReconnectConfig, AgentCardConfig, SkillConfig,
-};
+pub use zeroclaw_a2a::protocol::A2AConfig;
 
 // ── Config impl ──────────────────────────────────────────────────
 

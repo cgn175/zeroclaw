@@ -10,12 +10,13 @@
 //! - `GET /tasks/{id}/stream` - SSE stream for real-time task updates
 //! - `POST /tasks/{id}/cancel` - Cancel a running task
 
-use crate::channels::a2a::protocol::{
-    AgentCapabilities, AgentCard, AgentEndpoints, AuthenticationInfo, CancelTaskRequest,
-    CreateTaskResponse, Task, TaskMessage, TaskStatus, TaskUpdate,
-};
-use crate::config::schema::A2AConfig;
 use crate::gateway::AppState;
+use crate::config::schema::A2AConfig;
+use zeroclaw_a2a::protocol::{
+    AgentCapabilities, AgentCard, AgentEndpoints, AuthenticationInfo, CancelTaskRequest,
+    CreateTaskRequest, CreateTaskResponse, Skill, Task, TaskMessage, TaskStatus, TaskUpdate,
+};
+use zeroclaw_a2a::TaskEntry as A2ATaskEntry;
 use axum::{
     extract::{Path, State},
     http::{header, HeaderMap, StatusCode},
@@ -108,7 +109,7 @@ pub async fn handle_agent_card(State(state): State<AppState>) -> impl IntoRespon
                 skills: agent_card_config
                     .skills
                     .into_iter()
-                    .map(|s| crate::channels::a2a::protocol::Skill {
+                    .map(|s| Skill {
                         id: s.id,
                         name: s.name,
                         description: s.description,
@@ -133,7 +134,7 @@ pub async fn handle_create_task(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Result<
-        Json<crate::channels::a2a::protocol::CreateTaskRequest>,
+        Json<CreateTaskRequest>,
         axum::extract::rejection::JsonRejection,
     >,
 ) -> impl IntoResponse {
@@ -213,7 +214,7 @@ pub async fn handle_create_task(
         }
     });
 
-    let entry = TaskEntry {
+    let entry = A2ATaskEntry {
         task: task.clone(),
         update_tx,
         join_handle: Some(join_handle),
@@ -458,7 +459,7 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::A2APeerConfig;
+    use zeroclaw_a2a::A2APeer;
     use axum::http::HeaderValue;
 
     fn create_test_config() -> A2AConfig {
@@ -468,19 +469,19 @@ mod tests {
             discovery_mode: "static".to_string(),
             allowed_peer_ids: vec!["peer-1".to_string(), "peer-2".to_string()],
             peers: vec![
-                A2APeerConfig {
+                A2APeer {
                     id: "peer-1".to_string(),
                     endpoint: "https://peer1.example.com".to_string(),
                     bearer_token: "valid-token-1".to_string(),
                     enabled: true,
                 },
-                A2APeerConfig {
+                A2APeer {
                     id: "peer-2".to_string(),
                     endpoint: "https://peer2.example.com".to_string(),
                     bearer_token: "valid-token-2".to_string(),
                     enabled: true,
                 },
-                A2APeerConfig {
+                A2APeer {
                     id: "disabled-peer".to_string(),
                     endpoint: "https://disabled.example.com".to_string(),
                     bearer_token: "disabled-token".to_string(),

@@ -7630,6 +7630,7 @@ dependencies = [
  "wa-rs-tokio-transport",
  "wa-rs-ureq-http",
  "webpki-roots 1.0.6",
+ "zeroclaw-a2a",
 ]
 
 [[package]]

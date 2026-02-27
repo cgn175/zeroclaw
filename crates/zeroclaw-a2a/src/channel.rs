@@ -18,7 +18,7 @@
 //! - Maximum retries: 10
 //! - HTTP client timeout: 30s
 
-use crate::protocol::{A2AConfig, A2APeer, CreateTaskRequest, TaskMessage};
+use crate::protocol::{A2AConfig, A2APeer, CreateTaskRequest};
 use crate::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -282,7 +282,7 @@ impl A2AChannel {
         peer: A2APeer,
         reconnect_config: ReconnectConfig,
         http_client: reqwest::Client,
-        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
         connections: Arc<Mutex<HashMap<String, PeerConnection>>>,
     ) -> anyhow::Result<()> {
         let stream_url = format!("{}/tasks/stream", peer.endpoint);
@@ -378,9 +378,9 @@ impl Channel for A2AChannel {
 
     async fn listen(
         &self,
-        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> anyhow::Result<()> {
-        self.listen(tx).await
+        self.listen(_tx).await
     }
 
     async fn health_check(&self) -> bool {

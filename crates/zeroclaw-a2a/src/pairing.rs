@@ -233,9 +233,11 @@ impl<E: SecretEncryptor> PairingManager<E> {
 
 /// Generate a random 6-digit pairing code.
 fn generate_pairing_code() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let code: u32 = rng.gen_range(0..1_000_000);
+    use rand::distr::{Distribution, Uniform};
+    use rand::rng;
+    let mut rng = rng();
+    let uni = Uniform::new(0, 1_000_000).expect("valid range");
+    let code: u32 = uni.sample(&mut rng);
     format!("{:06}", code)
 }
 

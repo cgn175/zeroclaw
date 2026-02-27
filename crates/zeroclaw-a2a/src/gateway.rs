@@ -12,7 +12,7 @@
 
 use crate::protocol::{
     AgentCard, AgentCapabilities, AgentEndpoints, AuthenticationInfo, CancelTaskRequest,
-    CancelTaskResponse, CreateTaskResponse, GetTaskRequest, Task, TaskMessage, TaskStatus,
+    CreateTaskResponse, Task, TaskMessage, TaskStatus,
     TaskUpdate,
 };
 use crate::{AgentDispatcher, A2AConfig};

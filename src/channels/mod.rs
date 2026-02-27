@@ -2570,10 +2570,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
             let enabled_peer_count = a2a.peers.iter().filter(|p| p.enabled).count();
             if enabled_peer_count > 0 {
                 // Convert config schema types to protocol types
-                let protocol_peers: Vec<crate::channels::a2a::protocol::A2APeer> = a2a
+                let protocol_peers: Vec<zeroclaw_a2a::A2APeer> = a2a
                     .peers
                     .iter()
-                    .map(|p| crate::channels::a2a::protocol::A2APeer {
+                    .map(|p| zeroclaw_a2a::A2APeer {
                         id: p.id.clone(),
                         endpoint: p.endpoint.clone(),
                         bearer_token: p.bearer_token.clone(),
