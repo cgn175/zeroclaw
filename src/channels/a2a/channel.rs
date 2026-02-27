@@ -56,7 +56,7 @@ pub fn calculate_backoff_delay(attempt: u32, config: &ReconnectConfig) -> Durati
     // Use saturating math to prevent overflow
     let delay = config
         .initial_delay_secs
-        .saturating_mul(2_u64.saturating_pow(attempt.min(5)));
+        .saturating_mul(2_u64.saturating_pow(attempt.saturating_sub(1).min(5)));
     Duration::from_secs(delay.min(config.max_delay_secs))
 }
 
@@ -259,12 +259,8 @@ impl A2AChannel {
     ///
     /// Returns delay in milliseconds: 2s, 4s, 8s, 16s, 32s, capped at 60s.
     fn backoff_delay_ms(retry_count: u32) -> u64 {
-        let delay = if retry_count >= 6 {
-            60_000 // Cap at 60s
-        } else {
-            2u64.saturating_pow(retry_count + 1).saturating_mul(1000)
-        };
-        delay
+        let delay = 2u64.saturating_pow(retry_count + 1).saturating_mul(1000);
+        delay.min(60_000)
     }
 
     /// Perform health check on a single peer.

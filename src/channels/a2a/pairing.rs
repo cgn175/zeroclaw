@@ -300,7 +300,7 @@ pub fn is_tls_required(endpoint: &str) -> bool {
             "http" => {
                 // Allow HTTP for localhost only (testing)
                 let host = url.host_str().unwrap_or("");
-                matches!(host, "localhost" | "127.0.0.1" | "::1")
+                matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
             }
             _ => false,
         }
