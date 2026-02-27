@@ -2581,18 +2581,20 @@ pub async fn start_channels(config: Config) -> Result<()> {
                     })
                     .collect();
 
-                let a2a_protocol_config = crate::channels::a2a::protocol::A2AConfig {
+                // Map from main crate config to zeroclaw_a2a config
+                let a2a_protocol_config = zeroclaw_a2a::A2AConfig {
                     enabled: a2a.enabled,
                     listen_port: a2a.listen_port,
                     discovery_mode: a2a.discovery_mode.clone(),
                     allowed_peer_ids: a2a.allowed_peer_ids.clone(),
                     peers: protocol_peers,
-                    rate_limit: crate::channels::a2a::protocol::A2ARateLimitConfig::default(),
-                    idempotency: crate::channels::a2a::protocol::A2AIdempotencyConfig::default(),
+                    rate_limit: zeroclaw_a2a::A2ARateLimitConfig::default(),
+                    idempotency: zeroclaw_a2a::A2AIdempotencyConfig::default(),
+                    reconnect: zeroclaw_a2a::A2AReconnectConfig::default(),
                     agent_card: None,
                 };
 
-                channels.push(Arc::new(A2AChannel::new(a2a_protocol_config)));
+                channels.push(Arc::new(A2AChannel::new(a2a_protocol_config, None).expect("Failed to create A2A channel")));
                 tracing::info!(
                     "A2A channel registered with {} enabled peer(s)",
                     enabled_peer_count

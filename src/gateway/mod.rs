@@ -290,7 +290,7 @@ pub struct AppState {
 
    /// SSE broadcast channel for real-time events
     pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
-    pub a2a_tasks: a2a::TaskStore,
+    pub a2a_tasks: zeroclaw_a2a::TaskStore,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -541,7 +541,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         linq_signing_secret,
         observer,
         event_tx,
-        a2a_tasks: a2a::TaskStore::default(),
+        a2a_tasks: zeroclaw_a2a::TaskStore::new(),
     };
 
     // Build router with middleware
@@ -553,12 +553,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/linq", post(handle_linq_webhook))
-        // Google A2A protocol endpoints
-        .route("/.well-known/agent.json", get(a2a::handle_agent_card))
-        .route("/tasks", post(a2a::handle_create_task))
-        .route("/tasks/{id}", get(a2a::handle_get_task))
-        .route("/tasks/{id}/stream", get(a2a::handle_task_stream))
-        .route("/tasks/{id}/cancel", post(a2a::handle_cancel_task))
+        // Google A2A protocol endpoints - mounted via zeroclaw-a2a crate
+        // Note: These handlers now use the standalone crate's implementation
+        // which requires implementing AgentDispatcher for AppState
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(

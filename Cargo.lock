@@ -7633,6 +7633,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-a2a"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "futures-util",
+ "hex",
+ "parking_lot",
+ "rand 0.10.0",
+ "reqwest",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tokio-test",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "zeroclaw-robot-kit"
 version = "0.1.0"
 dependencies = [

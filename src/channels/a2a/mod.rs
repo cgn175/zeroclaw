@@ -20,18 +20,18 @@
 //!
 //! See [`protocol`] for the core message types:
 //!
-//! - [`AgentCard`](protocol::AgentCard) - Agent discovery document
-//! - [`Task`](protocol::Task) - Unit of work
-//! - [`TaskMessage`](protocol::TaskMessage) - Messages within a task
-//! - [`A2APeer`](protocol::A2APeer) - Peer configuration
-//! - [`A2AConfig`](protocol::A2AConfig) - Channel configuration
+//! - [`AgentCard`](zeroclaw_a2a::AgentCard) - Agent discovery document
+//! - [`Task`](zeroclaw_a2a::Task) - Unit of work
+//! - [`TaskMessage`](zeroclaw_a2a::TaskMessage) - Messages within a task
+//! - [`A2APeer`](zeroclaw_a2a::A2APeer) - Peer configuration
+//! - [`A2AConfig`](zeroclaw_a2a::A2AConfig) - Channel configuration
 //!
 //! # Pairing
 //!
 //! See [`pairing`] for peer authentication and pairing:
 //!
 //! - [`PairingManager`](pairing::PairingManager) - Manages pending pairing codes
-//! - [`initiate_peer_pairing`](pairing::initiate_peer_pairing) - Client pairing flow
+//! - [`initiate_peer_pairing`](zeroclaw_a2a::initiate_peer_pairing) - Client pairing flow
 //! - [`exchange_pairing_code`](pairing::exchange_pairing_code) - Exchange code for token
 //!
 //! # Security
@@ -43,8 +43,15 @@
 //! - Pairing codes expire after 5 minutes and are single-use
 //! - Constant-time comparison prevents timing attacks
 
-pub mod channel;
-pub mod pairing;
-pub mod protocol;
-
-pub use channel::A2AChannel;
+// Re-export all A2A types from the zeroclaw-a2a crate
+pub use zeroclaw_a2a::{
+    channel::{A2AChannel, PeerConnection, PeerState, ReconnectConfig, calculate_backoff_delay},
+    pairing::{self, PairingManager},
+    protocol::{
+        A2AConfig, A2AIdempotencyConfig, A2APeer, A2ARateLimitConfig, A2AReconnectConfig,
+        AgentCard, AgentCardConfig, AgentCapabilities, AgentEndpoints, AuthenticationInfo,
+        Artifact, ArtifactType, CancelTaskRequest, CancelTaskResponse, CreateTaskRequest,
+        CreateTaskResponse, GetTaskRequest, MessageRole, Skill, SkillConfig, Task,
+        TaskMessage, TaskStatus, TaskUpdate,
+    },
+};
