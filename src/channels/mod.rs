@@ -14,6 +14,8 @@
 //! To add a new channel, implement [`Channel`] in a new submodule and wire it into
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
+pub mod a2a;
+
 pub mod clawdtalk;
 pub mod cli;
 pub mod dingtalk;
@@ -66,6 +68,7 @@ pub use wati::WatiChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
+pub use a2a::A2AChannel;
 
 use crate::agent::loop_::{
     build_shell_policy_instructions, build_tool_instructions_from_specs, run_tool_call_loop,
@@ -3923,6 +3926,9 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
         crate::ChannelCommands::BindTelegram { identity } => {
             bind_telegram_identity(config, &identity).await
         }
+        crate::ChannelCommands::ListA2aPeers => {
+            anyhow::bail!("ListA2aPeers must be handled in main.rs (requires async runtime)")
+        }
     }
 }
 
@@ -4260,6 +4266,52 @@ fn collect_configured_channels(
             channel: Arc::new(ClawdTalkChannel::new(ct.clone())),
         });
     }
+
+    // A2A (Agent-to-Agent) channel
+    if let Some(ref a2a) = config.channels_config.a2a {
+        if a2a.enabled {
+            let enabled_peer_count = a2a.peers.iter().filter(|p| p.enabled).count();
+            if enabled_peer_count > 0 {
+                // Convert config schema types to protocol types
+                let protocol_peers: Vec<zeroclaw_a2a::A2APeer> = a2a
+                    .peers
+                    .iter()
+                    .map(|p| zeroclaw_a2a::A2APeer {
+                        id: p.id.clone(),
+                        endpoint: p.endpoint.clone(),
+                        bearer_token: p.bearer_token.clone(),
+                        enabled: p.enabled,
+                    })
+                    .collect();
+
+                // Map from main crate config to zeroclaw_a2a config
+                let a2a_protocol_config = zeroclaw_a2a::A2AConfig {
+                    enabled: a2a.enabled,
+                    listen_port: a2a.listen_port,
+                    discovery_mode: a2a.discovery_mode.clone(),
+                    allowed_peer_ids: a2a.allowed_peer_ids.clone(),
+                    peers: protocol_peers,
+                    rate_limit: zeroclaw_a2a::A2ARateLimitConfig::default(),
+                    idempotency: zeroclaw_a2a::A2AIdempotencyConfig::default(),
+                    reconnect: zeroclaw_a2a::A2AReconnectConfig::default(),
+                    agent_card: None,
+                };
+
+                channels.push(ConfiguredChannel{
+                    display_name: "A2A",
+                    channel:  Arc::new(A2AChannel::new(a2a_protocol_config, None).expect("Failed to create A2A channel"))
+                });
+                tracing::info!(
+                    "A2A channel registered with {} enabled peer(s)",
+                    enabled_peer_count
+                );
+            } else {
+                tracing::warn!("A2A channel enabled but no peers configured or all peers disabled");
+            }
+        }
+    }
+
+
 
     channels
 }

@@ -7,6 +7,8 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+pub mod a2a;
+
 pub mod api;
 mod openai_compat;
 pub mod sse;
@@ -328,6 +330,8 @@ pub struct AppState {
     pub cost_tracker: Option<Arc<CostTracker>>,
     /// SSE broadcast channel for real-time events
     pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+    /// A2A Protocol
+    pub a2a_tasks: zeroclaw_a2a::TaskStore,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -697,6 +701,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         max_tool_iterations,
         cost_tracker,
         event_tx,
+        a2a_tasks: zeroclaw_a2a::TaskStore::new(),
     };
 
     // Config PUT needs larger body limit (1MB)

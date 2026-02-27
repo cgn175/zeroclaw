@@ -1,0 +1,54 @@
+[package]
+name = "zeroclaw-a2a"
+version = "0.1.0"
+edition = "2021"
+authors = ["theonlyhennygod"]
+license = "Apache-2.0"
+description = "Google A2A protocol implementation for ZeroClaw"
+repository = "https://github.com/zeroclaw-labs/zeroclaw"
+keywords = ["a2a", "agent", "protocol", "google-a2a"]
+categories = ["network-programming", "api-bindings"]
+
+[dependencies]
+# Serialization
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+schemars = "1.2"
+
+# Async runtime
+tokio = { version = "1.42", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "io-std", "fs", "signal"] }
+tokio-stream = { version = "0.1.18", features = ["full"] }
+tokio-util = { version = "0.7", default-features = false }
+async-trait = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+
+# HTTP client/server
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream", "socks"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "macros"] }
+tower = { version = "0.5", default-features = false }
+
+# Utilities
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = { version = "0.1", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+uuid = { version = "1.11", default-features = false, features = ["v4", "std"] }
+
+# Crypto
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.10"
+
+# Concurrency
+parking_lot = "0.12"
+
+[dev-dependencies]
+tempfile = "3.14"
+tokio-test = "0.4"
+
+[profile.release]
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

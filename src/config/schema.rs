@@ -3253,6 +3253,8 @@ pub struct ChannelsConfig {
     pub nostr: Option<NostrConfig>,
     /// ClawdTalk voice channel configuration.
     pub clawdtalk: Option<crate::channels::clawdtalk::ClawdTalkConfig>,
+    /// A2A (Agent-to-Agent) channel configuration.
+    pub a2a: Option<A2AConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -3386,6 +3388,7 @@ impl Default for ChannelsConfig {
             qq: None,
             nostr: None,
             clawdtalk: None,
+            a2a: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
         }
     }
@@ -4589,6 +4592,9 @@ pub fn default_nostr_relays() -> Vec<String> {
         "wss://relay.snort.social".to_string(),
     ]
 }
+
+// A2A configuration types re-exported from zeroclaw-a2a crate
+pub use zeroclaw_a2a::protocol::A2AConfig;
 
 // ── Config impl ──────────────────────────────────────────────────
 
@@ -6878,6 +6884,7 @@ default_temperature = 0.7
                 qq: None,
                 nostr: None,
                 clawdtalk: None,
+                a2a: None,
                 message_timeout_secs: 300,
             },
             memory: MemoryConfig::default(),
@@ -7770,6 +7777,7 @@ allowed_users = ["@ops:matrix.org"]
             qq: None,
             nostr: None,
             clawdtalk: None,
+            a2a: None,
             message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
@@ -8048,6 +8056,7 @@ channel_id = "C123"
             qq: None,
             nostr: None,
             clawdtalk: None,
+            a2a: None,
             message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
