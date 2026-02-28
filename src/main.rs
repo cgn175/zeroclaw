@@ -164,6 +164,10 @@ enum Commands {
         /// Memory backend (sqlite, lucid, markdown, none) - used in quick mode, default: sqlite
         #[arg(long)]
         memory: Option<String>,
+
+        /// Disable OTP in quick setup (not recommended)
+        #[arg(long)]
+        no_totp: bool,
     },
 
     /// Start the AI agent loop
@@ -238,7 +242,8 @@ Examples:
   zeroclaw gateway                  # use config defaults
   zeroclaw gateway -p 8080          # listen on port 8080
   zeroclaw gateway --host 0.0.0.0   # bind to all interfaces
-  zeroclaw gateway -p 0             # random available port")]
+  zeroclaw gateway -p 0             # random available port
+  zeroclaw gateway --new-pairing    # clear tokens and generate fresh pairing code")]
     Gateway {
         /// Port to listen on (use 0 for random available port); defaults to config gateway.port
         #[arg(short, long)]
@@ -247,6 +252,10 @@ Examples:
         /// Host to bind to; defaults to config gateway.host
         #[arg(long)]
         host: Option<String>,
+
+        /// Clear all paired tokens and generate a fresh pairing code
+        #[arg(long)]
+        new_pairing: bool,
     },
 
     /// Start long-running autonomous runtime (gateway + channels + heartbeat + scheduler)
@@ -404,6 +413,7 @@ Examples:
     },
 
     /// Manage skills (user-defined capabilities)
+    #[command(name = "skill", alias = "skills")]
     Skills {
         #[command(subcommand)]
         skill_command: SkillCommands,
@@ -758,6 +768,7 @@ async fn main() -> Result<()> {
         provider,
         model,
         memory,
+        no_totp,
     } = &cli.command
     {
         let interactive = *interactive;
@@ -767,14 +778,21 @@ async fn main() -> Result<()> {
         let provider = provider.clone();
         let model = model.clone();
         let memory = memory.clone();
+        let no_totp = *no_totp;
 
         if interactive && channels_only {
             bail!("Use either --interactive or --channels-only, not both");
         }
         if channels_only
-            && (api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some())
+            && (api_key.is_some()
+                || provider.is_some()
+                || model.is_some()
+                || memory.is_some()
+                || no_totp)
         {
-            bail!("--channels-only does not accept --api-key, --provider, --model, or --memory");
+            bail!(
+                "--channels-only does not accept --api-key, --provider, --model, --memory, or --no-totp"
+            );
         }
         if channels_only && force {
             bail!("--channels-only does not accept --force");
@@ -790,6 +808,7 @@ async fn main() -> Result<()> {
                 model.as_deref(),
                 memory.as_deref(),
                 force,
+                no_totp,
             )
             .await
         }?;
@@ -852,6 +871,10 @@ async fn main() -> Result<()> {
             if let Some(ref backend) = memory_backend {
                 config.memory.backend = backend.clone();
             }
+            // interactive=true only when no --message flag (real REPL session).
+            // Single-shot mode (-m) runs non-interactively: no TTY approval prompt,
+            // so tools are not denied by a stdin read returning EOF.
+            let interactive = message.is_none();
             agent::run(
                 config,
                 message,
@@ -859,13 +882,25 @@ async fn main() -> Result<()> {
                 model,
                 temperature,
                 peripheral,
-                true,
+                interactive,
             )
             .await
             .map(|_| ())
         }
 
-        Commands::Gateway { port, host } => {
+        Commands::Gateway {
+            port,
+            host,
+            new_pairing,
+        } => {
+            if new_pairing {
+                // Persist token reset from raw config so env-derived overrides are not written to disk.
+                let mut persisted_config = Config::load_or_init().await?;
+                persisted_config.gateway.paired_tokens.clear();
+                persisted_config.save().await?;
+                config.gateway.paired_tokens.clear();
+                info!("🔐 Cleared paired tokens — a fresh pairing code will be generated");
+            }
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
@@ -2002,6 +2037,45 @@ mod tests {
     }
 
     #[test]
+    fn gateway_help_includes_new_pairing_flag() {
+        let cmd = Cli::command();
+        let gateway = cmd
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "gateway")
+            .expect("gateway subcommand must exist");
+
+        let has_new_pairing_flag = gateway.get_arguments().any(|arg| {
+            arg.get_id().as_str() == "new_pairing" && arg.get_long() == Some("new-pairing")
+        });
+
+        assert!(
+            has_new_pairing_flag,
+            "gateway help should include --new-pairing"
+        );
+    }
+
+    #[test]
+    fn gateway_cli_accepts_new_pairing_flag() {
+        let cli = Cli::try_parse_from(["zeroclaw", "gateway", "--new-pairing"])
+            .expect("gateway --new-pairing should parse");
+
+        match cli.command {
+            Commands::Gateway { new_pairing, .. } => assert!(new_pairing),
+            other => panic!("expected gateway command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gateway_cli_defaults_new_pairing_to_false() {
+        let cli = Cli::try_parse_from(["zeroclaw", "gateway"]).expect("gateway should parse");
+
+        match cli.command {
+            Commands::Gateway { new_pairing, .. } => assert!(!new_pairing),
+            other => panic!("expected gateway command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn completion_generation_mentions_binary_name() {
         let mut output = Vec::new();
         write_shell_completion(CompletionShell::Bash, &mut output)
@@ -2020,6 +2094,17 @@ mod tests {
 
         match cli.command {
             Commands::Onboard { force, .. } => assert!(force),
+            other => panic!("expected onboard command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn onboard_cli_accepts_no_totp_flag() {
+        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--no-totp"])
+            .expect("onboard --no-totp should parse");
+
+        match cli.command {
+            Commands::Onboard { no_totp, .. } => assert!(no_totp),
             other => panic!("expected onboard command, got {other:?}"),
         }
     }

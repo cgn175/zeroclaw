@@ -101,8 +101,8 @@ Notes:
 4. Approval gate possibility:
    - if Actions settings require maintainer approval for fork workflows, the `pull_request` run stays in `action_required`/waiting state until approved.
 5. Event fan-out after labeling:
-   - `pr-labeler.yml` and manual label changes emit `labeled`/`unlabeled` events.
-   - those events retrigger `pull_request_target` automation (`pr-labeler.yml` and `pr-auto-response.yml`), creating extra run volume/noise.
+   - manual label changes emit `labeled`/`unlabeled` events.
+   - those events retrigger only label-driven `pull_request_target` automation (`pr-auto-response.yml`); `pr-labeler.yml` now runs only on PR lifecycle events (`opened`/`reopened`/`synchronize`/`ready_for_review`) to reduce churn.
 6. When contributor pushes new commits to fork branch (`synchronize`):
    - reruns: `pr-intake-checks.yml`, `pr-labeler.yml`, `ci-run.yml`, `sec-audit.yml`, and matching path-scoped PR workflows.
    - does not rerun `pr-auto-response.yml` unless label/open events occur.
@@ -133,7 +133,7 @@ Notes:
 
 1. Commit reaches `dev` or `main` (usually from a merged PR), or merge queue creates a `merge_group` validation commit.
 2. `ci-run.yml` runs on `push` and `merge_group`.
-3. `feature-matrix.yml` runs on `push` for Rust/workflow paths and on `merge_group`.
+3. `feature-matrix.yml` runs on `push` to `dev` for Rust/workflow paths and on `merge_group`.
 4. `sec-audit.yml` runs on `push` and `merge_group`.
 5. `sec-codeql.yml` runs on `push`/`merge_group` when Rust/codeql paths change (path-scoped on push).
 6. `ci-supply-chain-provenance.yml` runs on push when Rust/build provenance paths change.
@@ -151,7 +151,7 @@ Workflow: `.github/workflows/pub-docker-img.yml`
 
 1. Triggered on `pull_request` to `dev` or `main` when Docker build-input paths change.
 2. Runs `PR Docker Smoke` job:
-   - Builds local smoke image with Blacksmith builder.
+   - Builds local smoke image with Buildx builder.
    - Verifies container with `docker run ... --version`.
 3. Typical runtime in recent sample: ~240.4s.
 4. No registry push happens on PR events.
@@ -206,7 +206,7 @@ Canary policy lane:
 
 1. Workflow-file changes (`.github/workflows/**`) activate owner-approval gate in `ci-run.yml`.
 2. PR lint/test strictness is intentionally controlled by `ci:full` label.
-3. `pr-intake-checks.yml` validates PR-template completeness and patch safety hints; no external tracker key is required.
+3. `pr-intake-checks.yml` now blocks PRs missing a Linear issue key (`RMN-*`, `CDV-*`, `COM-*`) to keep execution mapped to Linear.
 4. `sec-audit.yml` runs on PR/push/merge queue (`merge_group`), plus scheduled weekly.
 5. `ci-change-audit.yml` enforces pinned `uses:` references for CI/security workflow changes.
 6. `sec-audit.yml` includes deny policy hygiene checks (`deny_policy_guard.py`) before cargo-deny.
@@ -219,11 +219,11 @@ Canary policy lane:
 
 ## Mermaid Diagrams
 
-### PR to Main
+### PR to Dev
 
 ```mermaid
 flowchart TD
-  A["PR opened or updated -> main"] --> B["pull_request_target lane"]
+  A["PR opened or updated -> dev"] --> B["pull_request_target lane"]
   B --> B1["pr-intake-checks.yml"]
   B --> B2["pr-labeler.yml"]
   B --> B3["pr-auto-response.yml"]
@@ -237,7 +237,7 @@ flowchart TD
   D --> E{"Checks + review policy pass?"}
   E -->|No| F["PR stays open"]
   E -->|Yes| G["Merge PR"]
-  G --> H["push event on main"]
+  G --> H["push event on dev"]
 ```
 
 ### Promotion and Release
@@ -246,7 +246,7 @@ flowchart TD
 flowchart TD
   D0["Commit reaches dev"] --> B0["ci-run.yml"]
   D0 --> C0["sec-audit.yml"]
-  P["PR to main"] --> PG["main-promotion-gate.yml"]
+  P["Promotion PR dev -> main"] --> PG["main-promotion-gate.yml"]
   PG --> M["Merge to main"]
   M --> A["Commit reaches main"]
   A --> B["ci-run.yml"]

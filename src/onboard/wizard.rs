@@ -1,17 +1,21 @@
 use crate::config::schema::{
     default_nostr_relays, DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig,
-    NextcloudTalkConfig, NostrConfig, QQConfig, QQReceiveMode, SignalConfig, StreamMode,
-    WhatsAppConfig,
+    NextcloudTalkConfig, NostrConfig, QQConfig, QQEnvironment, QQReceiveMode, SignalConfig,
+    StreamMode, WhatsAppConfig,
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
-    HeartbeatConfig, HttpRequestConfig, IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig,
-    ObservabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig,
-    WebFetchConfig, WebSearchConfig, WebhookConfig,
+    HeartbeatConfig, HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig,
+    MemoryConfig, ObservabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig,
+    TelegramConfig, WebFetchConfig, WebSearchConfig, WebhookConfig,
 };
 use crate::hardware::{self, HardwareConfig};
+use crate::identity::{
+    default_aieos_identity_path, generate_default_aieos_json, selectable_identity_backends,
+};
 use crate::memory::{
-    default_memory_backend_key, memory_backend_profile, selectable_memory_backends,
+    classify_memory_backend, default_memory_backend_key, memory_backend_profile,
+    selectable_memory_backends, MemoryBackendKind,
 };
 use crate::providers::{
     canonical_china_provider_name, is_glm_alias, is_glm_cn_alias, is_minimax_alias,
@@ -90,7 +94,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
     );
     println!();
 
-    print_step(1, 10, "Workspace Setup");
+    print_step(1, 11, "Workspace Setup");
     let (workspace_dir, config_path) = setup_workspace().await?;
     match resolve_interactive_onboarding_mode(&config_path, force)? {
         InteractiveOnboardingMode::FullOnboarding => {}
@@ -99,32 +103,41 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         }
     }
 
-    print_step(2, 10, "AI Provider & API Key");
+    print_step(2, 11, "AI Provider & API Key");
     let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir).await?;
 
-    print_step(3, 10, "Channels (How You Talk to ZeroClaw)");
+    print_step(3, 11, "Channels (How You Talk to ZeroClaw)");
     let channels_config = setup_channels()?;
 
-    print_step(4, 10, "Tunnel (Expose to Internet)");
+    print_step(4, 11, "Tunnel (Expose to Internet)");
     let tunnel_config = setup_tunnel()?;
 
-    print_step(5, 10, "Tool Mode & Security");
+    print_step(5, 11, "Tool Mode & Security");
     let (composio_config, secrets_config) = setup_tool_mode()?;
 
-    print_step(6, 10, "Web & Internet Tools");
+    print_step(6, 11, "Web & Internet Tools");
     let (web_search_config, web_fetch_config, http_request_config) = setup_web_tools()?;
 
-    print_step(7, 10, "Hardware (Physical World)");
+    print_step(7, 11, "Hardware (Physical World)");
     let hardware_config = setup_hardware()?;
 
-    print_step(8, 10, "Memory Configuration");
+    print_step(8, 11, "Memory Configuration");
     let memory_config = setup_memory()?;
 
-    print_step(9, 10, "Project Context (Personalize Your Agent)");
+    print_step(9, 11, "Identity Backend");
+    let identity_config = setup_identity_backend()?;
+
+    print_step(10, 11, "Project Context (Personalize Your Agent)");
     let project_ctx = setup_project_context()?;
 
-    print_step(10, 10, "Workspace Files");
-    scaffold_workspace(&workspace_dir, &project_ctx).await?;
+    print_step(11, 11, "Workspace Files");
+    scaffold_workspace(
+        &workspace_dir,
+        &project_ctx,
+        &memory_config.backend,
+        &identity_config,
+    )
+    .await?;
 
     // ── Build config ──
     // Defaults: SQLite memory, supervised autonomy, workspace-scoped, native runtime
@@ -171,16 +184,19 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         web_fetch: web_fetch_config,
         web_search: web_search_config,
         proxy: crate::config::ProxyConfig::default(),
-        identity: crate::config::IdentityConfig::default(),
+        identity: identity_config,
         cost: crate::config::CostConfig::default(),
         peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
         hooks: crate::config::HooksConfig::default(),
+        plugins: crate::config::PluginsConfig::default(),
         hardware: hardware_config,
         query_classification: crate::config::QueryClassificationConfig::default(),
         transcription: crate::config::TranscriptionConfig::default(),
         agents_ipc: crate::config::AgentsIpcConfig::default(),
+        mcp: crate::config::schema::McpConfig::default(),
         model_support_vision: None,
+        wasm: crate::config::WasmConfig::default(),
     };
 
     println!(
@@ -411,6 +427,7 @@ pub async fn run_quick_setup(
     model_override: Option<&str>,
     memory_backend: Option<&str>,
     force: bool,
+    no_totp: bool,
 ) -> Result<Config> {
     let home = directories::UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
@@ -422,6 +439,7 @@ pub async fn run_quick_setup(
         model_override,
         memory_backend,
         force,
+        no_totp,
         &home,
     )
     .await
@@ -456,6 +474,7 @@ async fn run_quick_setup_with_home(
     model_override: Option<&str>,
     memory_backend: Option<&str>,
     force: bool,
+    no_totp: bool,
     home: &Path,
 ) -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
@@ -486,7 +505,7 @@ async fn run_quick_setup_with_home(
     // Create memory config based on backend choice
     let memory_config = memory_config_defaults_for_backend(&memory_backend_name);
 
-    let config = Config {
+    let mut config = Config {
         workspace_dir: workspace_dir.clone(),
         config_path: config_path.clone(),
         api_key: credential_override.map(|c| {
@@ -534,12 +553,18 @@ async fn run_quick_setup_with_home(
         peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
         hooks: crate::config::HooksConfig::default(),
+        plugins: crate::config::PluginsConfig::default(),
         hardware: crate::config::HardwareConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
         transcription: crate::config::TranscriptionConfig::default(),
         agents_ipc: crate::config::AgentsIpcConfig::default(),
+        mcp: crate::config::schema::McpConfig::default(),
         model_support_vision: None,
+        wasm: crate::config::WasmConfig::default(),
     };
+    if no_totp {
+        config.security.otp.enabled = false;
+    }
 
     config.save().await?;
     persist_workspace_selection(&config.config_path).await?;
@@ -553,7 +578,13 @@ async fn run_quick_setup_with_home(
             "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing."
                 .into(),
     };
-    scaffold_workspace(&workspace_dir, &default_ctx).await?;
+    scaffold_workspace(
+        &workspace_dir,
+        &default_ctx,
+        &config.memory.backend,
+        &config.identity,
+    )
+    .await?;
 
     println!(
         "  {} Workspace:  {}",
@@ -582,7 +613,11 @@ async fn run_quick_setup_with_home(
     println!(
         "  {} Security:   {}",
         style("✓").green().bold(),
-        style("Supervised (workspace-scoped)").green()
+        if no_totp {
+            style("Supervised (workspace-scoped), TOTP disabled (--no-totp)").yellow()
+        } else {
+            style("Supervised (workspace-scoped), TOTP enabled").green()
+        }
     );
     println!(
         "  {} Memory:     {} (auto-save: {})",
@@ -620,6 +655,16 @@ async fn run_quick_setup_with_home(
         style("Config saved:").white().bold(),
         style(config_path.display()).green()
     );
+    if no_totp {
+        println!(
+            "  {} {}",
+            style("⚠").yellow().bold(),
+            style(
+                "TOTP is disabled by operator choice. This reduces protection for sensitive actions."
+            )
+            .yellow()
+        );
+    }
     println!();
     println!("  {}", style("Next steps:").white().bold());
     if credential_override.is_none() {
@@ -707,6 +752,10 @@ const MINIMAX_ONBOARD_MODELS: [(&str, &str); 5] = [
 ];
 
 fn default_model_for_provider(provider: &str) -> String {
+    if provider == "qwen-coding-plan" {
+        return "qwen3-coder-plus".into();
+    }
+
     match canonical_provider_name(provider) {
         "anthropic" => "claude-sonnet-4-5-20250929".into(),
         "openai" => "gpt-5.2".into(),
@@ -739,6 +788,23 @@ fn default_model_for_provider(provider: &str) -> String {
 }
 
 fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
+    if provider_name == "qwen-coding-plan" {
+        return vec![
+            (
+                "qwen3-coder-plus".to_string(),
+                "Qwen3 Coder Plus (recommended for coding workflows)".to_string(),
+            ),
+            (
+                "qwen3.5-plus".to_string(),
+                "Qwen3.5 Plus (reasoning + coding)".to_string(),
+            ),
+            (
+                "qwen3-max-2026-01-23".to_string(),
+                "Qwen3 Max (high-capability coding model)".to_string(),
+            ),
+        ];
+    }
+
     match canonical_provider_name(provider_name) {
         "openrouter" => vec![
             (
@@ -1200,6 +1266,7 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
 
 fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
     match provider_name {
+        "qwen-coding-plan" => Some("https://coding.dashscope.aliyuncs.com/v1/models"),
         "qwen-intl" => Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models"),
         "dashscope-us" => Some("https://dashscope-us.aliyuncs.com/compatible-mode/v1/models"),
         "moonshot-cn" | "kimi-cn" => Some("https://api.moonshot.cn/v1/models"),
@@ -2220,6 +2287,10 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             ),
             ("minimax-cn", "MiniMax — China endpoint (api.minimaxi.com)"),
             ("qwen", "Qwen — DashScope China endpoint"),
+            (
+                "qwen-coding-plan",
+                "Qwen — DashScope coding plan endpoint (coding.dashscope.aliyuncs.com)",
+            ),
             ("qwen-intl", "Qwen — DashScope international endpoint"),
             ("qwen-us", "Qwen — DashScope US endpoint"),
             ("hunyuan", "Hunyuan — Tencent large models (T1, Turbo, Pro)"),
@@ -3544,6 +3615,58 @@ fn setup_memory() -> Result<MemoryConfig> {
 
     let mut config = memory_config_defaults_for_backend(backend);
     config.auto_save = auto_save;
+    Ok(config)
+}
+
+fn setup_identity_backend() -> Result<IdentityConfig> {
+    print_bullet("Choose the identity format ZeroClaw should scaffold for this workspace.");
+    print_bullet("You can switch later in config.toml under [identity].");
+    println!();
+
+    let backends = selectable_identity_backends();
+    let options: Vec<String> = backends
+        .iter()
+        .map(|profile| format!("{} — {}", profile.label, profile.description))
+        .collect();
+
+    let selected = Select::new()
+        .with_prompt("  Select identity backend")
+        .items(&options)
+        .default(0)
+        .interact()?;
+
+    let backend = backends
+        .get(selected)
+        .context("invalid identity backend selection")?;
+
+    let config = if backend.key == "aieos" {
+        let default_path = default_aieos_identity_path().to_string();
+        println!(
+            "  {} Identity: {} ({})",
+            style("✓").green().bold(),
+            style("aieos").green(),
+            style(&default_path).dim()
+        );
+        IdentityConfig {
+            format: "aieos".into(),
+            extra_files: Vec::new(),
+            aieos_path: Some(default_path),
+            aieos_inline: None,
+        }
+    } else {
+        println!(
+            "  {} Identity: {}",
+            style("✓").green().bold(),
+            style("openclaw").green()
+        );
+        IdentityConfig {
+            format: "openclaw".into(),
+            extra_files: Vec::new(),
+            aieos_path: None,
+            aieos_inline: None,
+        }
+    };
+
     Ok(config)
 }
 
@@ -4983,11 +5106,23 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     QQReceiveMode::Websocket
                 };
 
+                let environment_choice = Select::new()
+                    .with_prompt("  API environment")
+                    .items(["Production", "Sandbox (for unpublished bot testing)"])
+                    .default(0)
+                    .interact()?;
+                let environment = if environment_choice == 0 {
+                    QQEnvironment::Production
+                } else {
+                    QQEnvironment::Sandbox
+                };
+
                 config.qq = Some(QQConfig {
                     app_id,
                     app_secret,
                     allowed_users,
                     receive_mode,
+                    environment,
                 });
             }
             ChannelMenuChoice::LarkFeishu => {
@@ -5449,7 +5584,12 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
 // ── Step 6: Scaffold workspace files ─────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> {
+async fn scaffold_workspace(
+    workspace_dir: &Path,
+    ctx: &ProjectContext,
+    memory_backend: &str,
+    identity_config: &IdentityConfig,
+) -> Result<()> {
     let agent = if ctx.agent_name.is_empty() {
         "ZeroClaw"
     } else {
@@ -5470,6 +5610,74 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
     } else {
         &ctx.communication_style
     };
+    let memory_kind = classify_memory_backend(memory_backend);
+    let uses_markdown_memory = memory_kind == MemoryBackendKind::Markdown;
+    let memory_disabled = memory_kind == MemoryBackendKind::None;
+
+    let session_memory_steps = if uses_markdown_memory {
+        "3. Use `memory_recall` for recent context (daily notes are on-demand)\n\
+         4. If in MAIN SESSION (direct chat): `MEMORY.md` is already injected"
+            .to_string()
+    } else if memory_disabled {
+        "3. Memory is disabled (`memory.backend = \"none\"`) unless the user enables it".to_string()
+    } else {
+        format!(
+            "3. Use `memory_recall` for recent context (backend: `{memory_backend}`)\n\
+             4. Use `memory_store` to persist durable info (not files)"
+        )
+    };
+
+    let memory_system_block = if uses_markdown_memory {
+        "## Memory System\n\n\
+         You wake up fresh each session. These files ARE your continuity:\n\n\
+         - **Daily notes:** `memory/YYYY-MM-DD.md` — raw logs (accessed via memory tools)\n\
+         - **Long-term:** `MEMORY.md` — curated memories (auto-injected in main session)\n\n\
+         Capture what matters. Decisions, context, things to remember.\n\
+         Skip secrets unless asked to keep them.\n\n\
+         ### Write It Down — No Mental Notes!\n\
+         - Memory is limited — if you want to remember something, WRITE IT TO A FILE\n\
+         - \"Mental notes\" don't survive session restarts. Files do.\n\
+         - When someone says \"remember this\" -> update daily file or MEMORY.md\n\
+         - When you learn a lesson -> update AGENTS.md, TOOLS.md, or the relevant skill\n"
+            .to_string()
+    } else if memory_disabled {
+        "## Memory System\n\n\
+         Persistent memory is disabled in this workspace (`memory.backend = \"none\"`).\n\
+         Don't store memories unless the user explicitly enables memory in config.\n\
+         Rely on the current conversation and workspace files only.\n"
+            .to_string()
+    } else {
+        format!(
+            "## Memory System\n\n\
+             Persistent memory is stored in the configured backend (`{memory_backend}`).\n\
+             Use memory tools to store and retrieve durable context.\n\n\
+             - **memory_store** — save durable facts, preferences, decisions\n\
+             - **memory_recall** — search memory for relevant context\n\
+             - **memory_forget** — delete stale or incorrect memory\n\n\
+             ### Write It Down — No Mental Notes!\n\
+             - Memory is limited — if you want to remember something, STORE IT\n\
+             - \"Mental notes\" don't survive session restarts. Stored memory does.\n\
+             - When someone says \"remember this\" -> use memory_store\n\
+             - When you learn a lesson -> update AGENTS.md, TOOLS.md, or the relevant skill\n"
+        )
+    };
+
+    let crash_recovery_block = if uses_markdown_memory {
+        "## Crash Recovery\n\n\
+         - If a run stops unexpectedly, recover context before acting.\n\
+         - Check `MEMORY.md` + latest `memory/*.md` notes to avoid duplicate work.\n\
+         - Resume from the last confirmed step, not from scratch.\n"
+    } else if memory_disabled {
+        "## Crash Recovery\n\n\
+         - If a run stops unexpectedly, recover context before acting.\n\
+         - Memory is disabled, so ask the user for missing context.\n\
+         - Resume from the last confirmed step, not from scratch.\n"
+    } else {
+        "## Crash Recovery\n\n\
+         - If a run stops unexpectedly, recover context before acting.\n\
+         - Use `memory_recall` to load recent context and avoid duplicate work.\n\
+         - Resume from the last confirmed step, not from scratch.\n"
+    };
 
     let identity = format!(
         "# IDENTITY.md — Who Am I?\n\n\
@@ -5487,20 +5695,9 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          Before doing anything else:\n\n\
          1. Read `SOUL.md` — this is who you are\n\
          2. Read `USER.md` — this is who you're helping\n\
-         3. Use `memory_recall` for recent context (daily notes are on-demand)\n\
-         4. If in MAIN SESSION (direct chat): `MEMORY.md` is already injected\n\n\
+         {session_memory_steps}\n\n\
          Don't ask permission. Just do it.\n\n\
-         ## Memory System\n\n\
-         You wake up fresh each session. These files ARE your continuity:\n\n\
-         - **Daily notes:** `memory/YYYY-MM-DD.md` — raw logs (accessed via memory tools)\n\
-         - **Long-term:** `MEMORY.md` — curated memories (auto-injected in main session)\n\n\
-         Capture what matters. Decisions, context, things to remember.\n\
-         Skip secrets unless asked to keep them.\n\n\
-         ### Write It Down — No Mental Notes!\n\
-         - Memory is limited — if you want to remember something, WRITE IT TO A FILE\n\
-         - \"Mental notes\" don't survive session restarts. Files do.\n\
-         - When someone says \"remember this\" -> update daily file or MEMORY.md\n\
-         - When you learn a lesson -> update AGENTS.md, TOOLS.md, or the relevant skill\n\n\
+         {memory_system_block}\n\n\
          ## Safety\n\n\
          - Don't exfiltrate private data. Ever.\n\
          - Don't run destructive commands without asking.\n\
@@ -5515,10 +5712,7 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          ## Tools & Skills\n\n\
          Skills are listed in the system prompt. Use `read` on a skill's SKILL.md for details.\n\
          Keep local notes (SSH hosts, device names, etc.) in `TOOLS.md`.\n\n\
-         ## Crash Recovery\n\n\
-         - If a run stops unexpectedly, recover context before acting.\n\
-         - Check `MEMORY.md` + latest `memory/*.md` notes to avoid duplicate work.\n\
-         - Resume from the last confirmed step, not from scratch.\n\n\
+         {crash_recovery_block}\n\n\
          ## Sub-task Scoping\n\n\
          - Break complex work into focused sub-tasks with clear success criteria.\n\
          - Keep sub-tasks small, verify each output, then merge results.\n\
@@ -5664,7 +5858,7 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          ## Open Loops\n\
          (Track unfinished tasks and follow-ups here)\n";
 
-    let files: Vec<(&str, String)> = vec![
+    let mut files: Vec<(&str, String)> = vec![
         ("IDENTITY.md", identity),
         ("AGENTS.md", agents),
         ("HEARTBEAT.md", heartbeat),
@@ -5672,8 +5866,22 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
         ("USER.md", user_md),
         ("TOOLS.md", tools.to_string()),
         ("BOOTSTRAP.md", bootstrap),
-        ("MEMORY.md", memory.to_string()),
     ];
+    if uses_markdown_memory {
+        files.push(("MEMORY.md", memory.to_string()));
+    }
+
+    let mut aieos_identity_file: Option<(String, String)> = None;
+    if identity_config.format == "aieos" {
+        let path = identity_config
+            .aieos_path
+            .as_deref()
+            .filter(|path| !path.trim().is_empty())
+            .unwrap_or(default_aieos_identity_path())
+            .to_string();
+        let content = generate_default_aieos_json(agent, user);
+        aieos_identity_file = Some((path, content));
+    }
 
     // Create subdirectories
     let subdirs = ["sessions", "memory", "state", "cron", "skills"];
@@ -5689,6 +5897,19 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
         if path.exists() {
             skipped += 1;
         } else {
+            fs::write(&path, content).await?;
+            created += 1;
+        }
+    }
+
+    if let Some((relative_path, content)) = aieos_identity_file {
+        let path = workspace_dir.join(&relative_path);
+        if path.exists() {
+            skipped += 1;
+        } else {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).await?;
+            }
             fs::write(&path, content).await?;
             created += 1;
         }
@@ -6010,6 +6231,7 @@ mod tests {
         model_override: Option<&str>,
         memory_backend: Option<&str>,
         force: bool,
+        no_totp: bool,
         home: &Path,
     ) -> Result<Config> {
         let _env_guard = env_lock().lock().await;
@@ -6022,6 +6244,7 @@ mod tests {
             model_override,
             memory_backend,
             force,
+            no_totp,
             home,
         )
         .await
@@ -6099,6 +6322,7 @@ mod tests {
             Some("custom-model-946"),
             Some("sqlite"),
             false,
+            false,
             tmp.path(),
         )
         .await
@@ -6123,6 +6347,7 @@ mod tests {
             None,
             Some("sqlite"),
             false,
+            false,
             tmp.path(),
         )
         .await
@@ -6131,6 +6356,44 @@ mod tests {
         let expected = default_model_for_provider("anthropic");
         assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
         assert_eq!(config.default_model.as_deref(), Some(expected.as_str()));
+    }
+
+    #[tokio::test]
+    async fn quick_setup_enables_totp_by_default() {
+        let tmp = TempDir::new().unwrap();
+
+        let config = run_quick_setup_with_clean_env(
+            Some("sk-totp-default"),
+            Some("openrouter"),
+            None,
+            Some("sqlite"),
+            false,
+            false,
+            tmp.path(),
+        )
+        .await
+        .expect("quick setup should succeed");
+
+        assert!(config.security.otp.enabled);
+    }
+
+    #[tokio::test]
+    async fn quick_setup_no_totp_disables_totp() {
+        let tmp = TempDir::new().unwrap();
+
+        let config = run_quick_setup_with_clean_env(
+            Some("sk-no-totp"),
+            Some("openrouter"),
+            None,
+            Some("sqlite"),
+            false,
+            true,
+            tmp.path(),
+        )
+        .await
+        .expect("quick setup should succeed with --no-totp behavior");
+
+        assert!(!config.security.otp.enabled);
     }
 
     #[tokio::test]
@@ -6149,6 +6412,7 @@ mod tests {
             Some("openrouter"),
             Some("custom-model"),
             Some("sqlite"),
+            false,
             false,
             tmp.path(),
         )
@@ -6180,6 +6444,7 @@ mod tests {
             Some("custom-model-fresh"),
             Some("sqlite"),
             true,
+            false,
             tmp.path(),
         )
         .await
@@ -6214,6 +6479,7 @@ mod tests {
             Some("model-env"),
             Some("sqlite"),
             false,
+            false,
             tmp.path(),
         )
         .await
@@ -6226,10 +6492,17 @@ mod tests {
     // ── scaffold_workspace: basic file creation ─────────────────
 
     #[tokio::test]
-    async fn scaffold_creates_all_md_files() {
+    async fn scaffold_creates_markdown_md_files() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "markdown",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let expected = [
             "IDENTITY.md",
@@ -6247,14 +6520,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scaffold_skips_memory_md_for_sqlite() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = ProjectContext::default();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        let expected = [
+            "IDENTITY.md",
+            "AGENTS.md",
+            "HEARTBEAT.md",
+            "SOUL.md",
+            "USER.md",
+            "TOOLS.md",
+            "BOOTSTRAP.md",
+        ];
+        for f in &expected {
+            assert!(tmp.path().join(f).exists(), "missing file: {f}");
+        }
+        assert!(
+            !tmp.path().join("MEMORY.md").exists(),
+            "MEMORY.md should not be created for sqlite backend"
+        );
+    }
+
+    #[tokio::test]
     async fn scaffold_creates_all_subdirectories() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         for dir in &["sessions", "memory", "state", "cron", "skills"] {
             assert!(tmp.path().join(dir).is_dir(), "missing subdirectory: {dir}");
         }
+    }
+
+    #[tokio::test]
+    async fn scaffold_creates_default_aieos_identity_file_when_selected() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = ProjectContext {
+            user_name: "Argenis".into(),
+            agent_name: "Crabby".into(),
+            ..Default::default()
+        };
+        let identity_config = crate::config::IdentityConfig {
+            format: "aieos".into(),
+            extra_files: Vec::new(),
+            aieos_path: Some("identity.aieos.json".into()),
+            aieos_inline: None,
+        };
+
+        scaffold_workspace(tmp.path(), &ctx, "sqlite", &identity_config)
+            .await
+            .unwrap();
+
+        let identity_path = tmp.path().join("identity.aieos.json");
+        assert!(
+            identity_path.exists(),
+            "AIEOS identity file should be scaffolded"
+        );
+
+        let raw = tokio::fs::read_to_string(identity_path).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(payload["identity"]["names"]["first"], "Crabby");
+        assert_eq!(
+            payload["motivations"]["core_drive"],
+            "Help Argenis ship high-quality work."
+        );
+    }
+
+    #[tokio::test]
+    async fn scaffold_does_not_overwrite_existing_aieos_identity_file() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = ProjectContext::default();
+        let identity_config = crate::config::IdentityConfig {
+            format: "aieos".into(),
+            extra_files: Vec::new(),
+            aieos_path: Some("identity.aieos.json".into()),
+            aieos_inline: None,
+        };
+
+        let custom = r#"{"identity":{"names":{"first":"Custom"}}}"#;
+        tokio::fs::write(tmp.path().join("identity.aieos.json"), custom)
+            .await
+            .unwrap();
+
+        scaffold_workspace(tmp.path(), &ctx, "sqlite", &identity_config)
+            .await
+            .unwrap();
+
+        let raw = tokio::fs::read_to_string(tmp.path().join("identity.aieos.json"))
+            .await
+            .unwrap();
+        assert_eq!(raw, custom);
     }
 
     // ── scaffold_workspace: personalization ─────────────────────
@@ -6266,7 +6637,14 @@ mod tests {
             user_name: "Alice".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
             .await
@@ -6292,7 +6670,14 @@ mod tests {
             timezone: "US/Pacific".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
             .await
@@ -6318,7 +6703,14 @@ mod tests {
             agent_name: "Crabby".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
             .await
@@ -6368,7 +6760,14 @@ mod tests {
             communication_style: "Be technical and detailed.".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
@@ -6401,7 +6800,14 @@ mod tests {
     async fn scaffold_uses_defaults_for_empty_context() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default(); // all empty
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
             .await
@@ -6448,7 +6854,14 @@ mod tests {
             .await
             .unwrap();
 
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         // SOUL.md should be untouched
         let soul = tokio::fs::read_to_string(&soul_path).await.unwrap();
@@ -6479,13 +6892,27 @@ mod tests {
             ..Default::default()
         };
 
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
         let soul_v1 = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
             .unwrap();
 
         // Run again — should not change anything
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
         let soul_v2 = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
             .unwrap();
@@ -6496,10 +6923,44 @@ mod tests {
     // ── scaffold_workspace: all files are non-empty ─────────────
 
     #[tokio::test]
-    async fn scaffold_files_are_non_empty() {
+    async fn scaffold_files_are_non_empty_sqlite() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        for f in &[
+            "IDENTITY.md",
+            "AGENTS.md",
+            "HEARTBEAT.md",
+            "SOUL.md",
+            "USER.md",
+            "TOOLS.md",
+            "BOOTSTRAP.md",
+        ] {
+            let content = tokio::fs::read_to_string(tmp.path().join(f)).await.unwrap();
+            assert!(!content.trim().is_empty(), "{f} should not be empty");
+        }
+    }
+
+    #[tokio::test]
+    async fn scaffold_files_are_non_empty_markdown() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = ProjectContext::default();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "markdown",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         for f in &[
             "IDENTITY.md",
@@ -6519,10 +6980,17 @@ mod tests {
     // ── scaffold_workspace: AGENTS.md references on-demand memory
 
     #[tokio::test]
-    async fn agents_md_references_on_demand_memory() {
+    async fn agents_md_references_on_demand_memory_markdown() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "markdown",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let agents = tokio::fs::read_to_string(tmp.path().join("AGENTS.md"))
             .await
@@ -6537,13 +7005,58 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn agents_md_uses_backend_memory_for_sqlite() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = ProjectContext::default();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        let agents = tokio::fs::read_to_string(tmp.path().join("AGENTS.md"))
+            .await
+            .unwrap();
+        assert!(
+            agents.contains("memory_recall"),
+            "AGENTS.md should reference memory_recall"
+        );
+        assert!(
+            agents.contains("memory_store"),
+            "AGENTS.md should reference memory_store"
+        );
+        assert!(
+            agents.contains("backend: `sqlite`"),
+            "AGENTS.md should mention the sqlite backend"
+        );
+        assert!(
+            !agents.contains("MEMORY.md"),
+            "AGENTS.md should not mention MEMORY.md for sqlite backend"
+        );
+        assert!(
+            !agents.contains("memory/YYYY-MM-DD.md"),
+            "AGENTS.md should not mention daily note files for sqlite backend"
+        );
+    }
+
     // ── scaffold_workspace: MEMORY.md warns about token cost ────
 
     #[tokio::test]
     async fn memory_md_warns_about_token_cost() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "markdown",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let memory = tokio::fs::read_to_string(tmp.path().join("MEMORY.md"))
             .await
@@ -6564,7 +7077,14 @@ mod tests {
     async fn tools_md_lists_all_builtin_tools() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let tools = tokio::fs::read_to_string(tmp.path().join("TOOLS.md"))
             .await
@@ -6596,7 +7116,14 @@ mod tests {
     async fn soul_md_includes_emoji_awareness_guidance() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
@@ -6622,7 +7149,14 @@ mod tests {
             timezone: "Europe/Madrid".into(),
             communication_style: "Be direct.".into(),
         };
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
             .await
@@ -6648,7 +7182,14 @@ mod tests {
                 "Be friendly, human, and conversational. Show warmth and empathy while staying efficient. Use natural contractions."
                     .into(),
         };
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(
+            tmp.path(),
+            &ctx,
+            "sqlite",
+            &crate::config::IdentityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         // Verify every file got personalized
         let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
@@ -6703,6 +7244,10 @@ mod tests {
         );
         assert_eq!(default_model_for_provider("qwen"), "qwen-plus");
         assert_eq!(default_model_for_provider("qwen-intl"), "qwen-plus");
+        assert_eq!(
+            default_model_for_provider("qwen-coding-plan"),
+            "qwen3-coder-plus"
+        );
         assert_eq!(default_model_for_provider("qwen-code"), "qwen3-coder-plus");
         assert_eq!(default_model_for_provider("glm-cn"), "glm-5");
         assert_eq!(default_model_for_provider("minimax-cn"), "MiniMax-M2.5");
@@ -6746,6 +7291,7 @@ mod tests {
     fn canonical_provider_name_normalizes_regional_aliases() {
         assert_eq!(canonical_provider_name("qwen-intl"), "qwen");
         assert_eq!(canonical_provider_name("dashscope-us"), "qwen");
+        assert_eq!(canonical_provider_name("qwen-coding-plan"), "qwen");
         assert_eq!(canonical_provider_name("qwen-code"), "qwen-code");
         assert_eq!(canonical_provider_name("qwen-oauth"), "qwen-code");
         assert_eq!(canonical_provider_name("codex"), "openai-codex");
@@ -6878,6 +7424,18 @@ mod tests {
     }
 
     #[test]
+    fn curated_models_for_qwen_coding_plan_include_coding_models() {
+        let ids: Vec<String> = curated_models_for_provider("qwen-coding-plan")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        assert!(ids.contains(&"qwen3-coder-plus".to_string()));
+        assert!(ids.contains(&"qwen3.5-plus".to_string()));
+        assert!(ids.contains(&"qwen3-max-2026-01-23".to_string()));
+    }
+
+    #[test]
     fn supports_live_model_fetch_for_supported_and_unsupported_providers() {
         assert!(supports_live_model_fetch("openai"));
         assert!(supports_live_model_fetch("anthropic"));
@@ -6897,6 +7455,7 @@ mod tests {
         assert!(supports_live_model_fetch("venice"));
         assert!(supports_live_model_fetch("glm-cn"));
         assert!(supports_live_model_fetch("qwen-intl"));
+        assert!(supports_live_model_fetch("qwen-coding-plan"));
         assert!(!supports_live_model_fetch("minimax-cn"));
         assert!(!supports_live_model_fetch("unknown-provider"));
     }
@@ -6926,6 +7485,10 @@ mod tests {
         assert_eq!(
             curated_models_for_provider("qwen"),
             curated_models_for_provider("dashscope-us")
+        );
+        assert_eq!(
+            curated_models_for_provider("qwen-coding-plan"),
+            curated_models_for_provider("qwen-code")
         );
         assert_eq!(
             curated_models_for_provider("minimax"),
@@ -6978,6 +7541,10 @@ mod tests {
         assert_eq!(
             models_endpoint_for_provider("qwen-intl"),
             Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("qwen-coding-plan"),
+            Some("https://coding.dashscope.aliyuncs.com/v1/models")
         );
     }
 
@@ -7285,6 +7852,7 @@ mod tests {
         assert_eq!(provider_env_var("qwen"), "DASHSCOPE_API_KEY");
         assert_eq!(provider_env_var("qwen-intl"), "DASHSCOPE_API_KEY");
         assert_eq!(provider_env_var("dashscope-us"), "DASHSCOPE_API_KEY");
+        assert_eq!(provider_env_var("qwen-coding-plan"), "DASHSCOPE_API_KEY");
         assert_eq!(provider_env_var("qwen-code"), "QWEN_OAUTH_TOKEN");
         assert_eq!(provider_env_var("qwen-oauth"), "QWEN_OAUTH_TOKEN");
         assert_eq!(provider_env_var("glm-cn"), "GLM_API_KEY");
@@ -7426,6 +7994,7 @@ mod tests {
             app_secret: "app-secret".into(),
             allowed_users: vec!["*".into()],
             receive_mode: crate::config::schema::QQReceiveMode::Websocket,
+            environment: crate::config::schema::QQEnvironment::Production,
         });
         assert!(has_launchable_channels(&channels));
 

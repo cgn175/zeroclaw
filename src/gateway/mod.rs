@@ -11,6 +11,7 @@ pub mod a2a;
 
 pub mod api;
 mod openai_compat;
+mod openclaw_compat;
 pub mod sse;
 pub mod static_files;
 pub mod ws;
@@ -31,13 +32,14 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{ConnectInfo, Query, State},
     http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Json},
+    response::{IntoResponse, Json, Response},
     routing::{delete, get, post, put},
     Router,
 };
+use futures_util::StreamExt;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -60,10 +62,6 @@ pub const IDEMPOTENCY_MAX_KEYS_DEFAULT: usize = 10_000;
 
 fn webhook_memory_key() -> String {
     format!("webhook_msg_{}", Uuid::new_v4())
-}
-
-fn api_chat_memory_key() -> String {
-    format!("api_chat_msg_{}", Uuid::new_v4())
 }
 
 fn whatsapp_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
@@ -524,10 +522,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // QQ channel (if configured)
     let qq_channel: Option<Arc<QQChannel>> = config.channels_config.qq.as_ref().map(|qq_cfg| {
-        Arc::new(QQChannel::new(
+        Arc::new(QQChannel::new_with_environment(
             qq_cfg.app_id.clone(),
             qq_cfg.app_secret.clone(),
             qq_cfg.allowed_users.clone(),
+            qq_cfg.environment.clone(),
         ))
     });
     let qq_webhook_enabled = config
@@ -618,7 +617,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     println!("  🌐 Web Dashboard: http://{display_addr}/");
     println!("  POST /pair      — pair a new client (X-Pairing-Code header)");
     println!("  POST /webhook   — {{\"message\": \"your prompt\"}}");
-    println!("  POST /api/chat  — {{\"message\": \"your prompt\"}} (tools-enabled)");
+    println!("  POST /api/chat  — {{\"message\": \"...\", \"context\": [...]}} (tools-enabled, OpenClaw compat)");
     if whatsapp_channel.is_some() {
         println!("  GET  /whatsapp  — Meta webhook verification");
         println!("  POST /whatsapp  — WhatsApp message webhook");
@@ -639,7 +638,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     if config.gateway.node_control.enabled {
         println!("  POST /api/node-control — experimental node-control RPC scaffold");
     }
-    println!("  POST /v1/chat/completions — OpenAI-compatible chat");
+    println!("  POST /v1/chat/completions — OpenAI-compatible (full agent loop)");
     println!("  GET  /v1/models — list available models");
     println!("  GET  /api/*     — REST API (bearer token required)");
     println!("  GET  /ws/chat   — WebSocket agent chat");
@@ -712,10 +711,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // The OpenAI-compatible endpoints use a larger body limit (512KB) because
     // chat histories can be much bigger than the default 64KB webhook limit.
     // They get their own nested router with a separate body limit layer.
+    //
+    // NOTE: The /v1/chat/completions handler routes through the full agent loop
+    // (run_gateway_chat_with_tools) via openclaw_compat, giving OpenClaw callers
+    // tools + memory support. The original simple-chat handler is preserved in
+    // openai_compat.rs for reference.
     let openai_compat_routes = Router::new()
         .route(
             "/v1/chat/completions",
-            post(openai_compat::handle_v1_chat_completions),
+            post(openclaw_compat::handle_v1_chat_completions_with_tools),
         )
         .layer(RequestBodyLimitLayer::new(
             openai_compat::CHAT_COMPLETIONS_MAX_BODY_SIZE,
@@ -727,7 +731,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
-        .route("/webhook", post(handle_webhook))
+        .route("/webhook", get(handle_webhook_usage).post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/linq", post(handle_linq_webhook))
@@ -735,7 +739,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/wati", post(handle_wati_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
         .route("/qq", post(handle_qq_webhook))
-        .route("/api/chat", post(handle_api_chat))
+        // ── OpenClaw migration: tools-enabled chat endpoint ──
+        .route("/api/chat", post(openclaw_compat::handle_api_chat))
         // ── OpenAI-compatible endpoints ──
         .route("/v1/models", get(openai_compat::handle_v1_models))
         .merge(openai_compat_routes)
@@ -932,7 +937,10 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
 }
 
 /// Simple chat for webhook endpoint (no tools, for backward compatibility and testing).
-async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Result<String> {
+async fn prepare_gateway_messages_for_provider(
+    state: &AppState,
+    message: &str,
+) -> anyhow::Result<Vec<ChatMessage>> {
     let user_messages = vec![ChatMessage::user(message)];
 
     // Keep webhook/gateway prompts aligned with channel behavior by injecting
@@ -957,14 +965,24 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
     let prepared =
         crate::multimodal::prepare_messages_for_provider(&messages, &multimodal_config).await?;
 
+    Ok(prepared.messages)
+}
+
+/// Simple chat for webhook endpoint (no tools, for backward compatibility and testing).
+async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Result<String> {
+    let prepared_messages = prepare_gateway_messages_for_provider(state, message).await?;
+
     state
         .provider
-        .chat_with_history(&prepared.messages, &state.model, state.temperature)
+        .chat_with_history(&prepared_messages, &state.model, state.temperature)
         .await
 }
 
 /// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
-async fn run_gateway_chat_with_tools(state: &AppState, message: &str) -> anyhow::Result<String> {
+pub(super) async fn run_gateway_chat_with_tools(
+    state: &AppState,
+    message: &str,
+) -> anyhow::Result<String> {
     let config = state.config.lock().clone();
     crate::agent::process_message(config, message).await
 }
@@ -983,11 +1001,8 @@ fn sanitize_gateway_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
     pub message: String,
-}
-
-#[derive(serde::Deserialize)]
-pub struct ApiChatBody {
-    pub message: String,
+    #[serde(default)]
+    pub stream: Option<bool>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1173,27 +1188,272 @@ async fn handle_node_control(
     }
 }
 
-fn enforce_gateway_auth(
-    state: &AppState,
-    peer_addr: SocketAddr,
-    headers: &HeaderMap,
-    endpoint: &str,
-) -> std::result::Result<(), (StatusCode, serde_json::Value)> {
+/// POST /webhook — main webhook endpoint
+async fn handle_webhook_usage() -> impl IntoResponse {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        Json(serde_json::json!({
+            "error": "Use POST /webhook with a JSON body: {\"message\":\"...\"}",
+            "method": "POST",
+            "path": "/webhook",
+            "example": {
+                "message": "Hello from webhook"
+            }
+        })),
+    )
+}
+
+fn handle_webhook_streaming(
+    state: AppState,
+    prepared_messages: Vec<ChatMessage>,
+    provider_label: String,
+    model_label: String,
+    started_at: Instant,
+) -> Response {
+    if !state.provider.supports_streaming() {
+        let model_for_call = state.model.clone();
+        let provider_label_for_call = provider_label.clone();
+        let model_label_for_call = model_label.clone();
+        let state_for_call = state.clone();
+        let messages_for_call = prepared_messages.clone();
+
+        let stream = futures_util::stream::once(async move {
+            match state_for_call
+                .provider
+                .chat_with_history(
+                    &messages_for_call,
+                    &model_for_call,
+                    state_for_call.temperature,
+                )
+                .await
+            {
+                Ok(response) => {
+                    let safe_response = sanitize_gateway_response(
+                        &response,
+                        state_for_call.tools_registry_exec.as_ref(),
+                    );
+                    let duration = started_at.elapsed();
+                    state_for_call.observer.record_event(
+                        &crate::observability::ObserverEvent::LlmResponse {
+                            provider: provider_label_for_call.clone(),
+                            model: model_label_for_call.clone(),
+                            duration,
+                            success: true,
+                            error_message: None,
+                            input_tokens: None,
+                            output_tokens: None,
+                        },
+                    );
+                    state_for_call.observer.record_metric(
+                        &crate::observability::traits::ObserverMetric::RequestLatency(duration),
+                    );
+                    state_for_call.observer.record_event(
+                        &crate::observability::ObserverEvent::AgentEnd {
+                            provider: provider_label_for_call,
+                            model: model_label_for_call,
+                            duration,
+                            tokens_used: None,
+                            cost_usd: None,
+                        },
+                    );
+
+                    let payload = serde_json::json!({"response": safe_response, "model": state_for_call.model});
+                    let mut output = format!("data: {payload}\n\n");
+                    output.push_str("data: [DONE]\n\n");
+                    Ok::<_, std::io::Error>(Bytes::from(output))
+                }
+                Err(e) => {
+                    let duration = started_at.elapsed();
+                    let sanitized = providers::sanitize_api_error(&e.to_string());
+
+                    state_for_call.observer.record_event(
+                        &crate::observability::ObserverEvent::LlmResponse {
+                            provider: provider_label_for_call.clone(),
+                            model: model_label_for_call.clone(),
+                            duration,
+                            success: false,
+                            error_message: Some(sanitized.clone()),
+                            input_tokens: None,
+                            output_tokens: None,
+                        },
+                    );
+                    state_for_call.observer.record_metric(
+                        &crate::observability::traits::ObserverMetric::RequestLatency(duration),
+                    );
+                    state_for_call.observer.record_event(
+                        &crate::observability::ObserverEvent::Error {
+                            component: "gateway".to_string(),
+                            message: sanitized.clone(),
+                        },
+                    );
+                    state_for_call.observer.record_event(
+                        &crate::observability::ObserverEvent::AgentEnd {
+                            provider: provider_label_for_call,
+                            model: model_label_for_call,
+                            duration,
+                            tokens_used: None,
+                            cost_usd: None,
+                        },
+                    );
+
+                    tracing::error!("Webhook provider error: {}", sanitized);
+                    let mut output = format!(
+                        "data: {}\n\n",
+                        serde_json::json!({"error": "LLM request failed"})
+                    );
+                    output.push_str("data: [DONE]\n\n");
+                    Ok(Bytes::from(output))
+                }
+            }
+        });
+
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CONNECTION, "keep-alive")
+            .body(Body::from_stream(stream))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+
+    let provider_stream = state.provider.stream_chat_with_history(
+        &prepared_messages,
+        &state.model,
+        state.temperature,
+        crate::providers::traits::StreamOptions::new(true),
+    );
+
+    let state_for_stream = state.clone();
+    let provider_label_for_stream = provider_label.clone();
+    let model_label_for_stream = model_label.clone();
+    let mut stream_failed = false;
+
+    let sse_stream = provider_stream.map(move |result| match result {
+        Ok(chunk) if chunk.is_final => {
+            if !stream_failed {
+                let duration = started_at.elapsed();
+                state_for_stream.observer.record_event(
+                    &crate::observability::ObserverEvent::LlmResponse {
+                        provider: provider_label_for_stream.clone(),
+                        model: model_label_for_stream.clone(),
+                        duration,
+                        success: true,
+                        error_message: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                    },
+                );
+                state_for_stream.observer.record_metric(
+                    &crate::observability::traits::ObserverMetric::RequestLatency(duration),
+                );
+                state_for_stream.observer.record_event(
+                    &crate::observability::ObserverEvent::AgentEnd {
+                        provider: provider_label_for_stream.clone(),
+                        model: model_label_for_stream.clone(),
+                        duration,
+                        tokens_used: None,
+                        cost_usd: None,
+                    },
+                );
+            }
+            Ok::<_, std::io::Error>(Bytes::from("data: [DONE]\n\n"))
+        }
+        Ok(chunk) => {
+            if chunk.delta.is_empty() {
+                return Ok(Bytes::new());
+            }
+            let payload = serde_json::json!({
+                "delta": chunk.delta,
+                "model": model_label_for_stream
+            });
+            Ok(Bytes::from(format!("data: {payload}\n\n")))
+        }
+        Err(e) => {
+            stream_failed = true;
+            let duration = started_at.elapsed();
+            let sanitized = providers::sanitize_api_error(&e.to_string());
+
+            state_for_stream.observer.record_event(
+                &crate::observability::ObserverEvent::LlmResponse {
+                    provider: provider_label_for_stream.clone(),
+                    model: model_label_for_stream.clone(),
+                    duration,
+                    success: false,
+                    error_message: Some(sanitized.clone()),
+                    input_tokens: None,
+                    output_tokens: None,
+                },
+            );
+            state_for_stream.observer.record_metric(
+                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
+            );
+            state_for_stream
+                .observer
+                .record_event(&crate::observability::ObserverEvent::Error {
+                    component: "gateway".to_string(),
+                    message: sanitized.clone(),
+                });
+            state_for_stream.observer.record_event(
+                &crate::observability::ObserverEvent::AgentEnd {
+                    provider: provider_label_for_stream.clone(),
+                    model: model_label_for_stream.clone(),
+                    duration,
+                    tokens_used: None,
+                    cost_usd: None,
+                },
+            );
+
+            tracing::error!("Webhook streaming provider error: {}", sanitized);
+            let output = format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({"error": "LLM request failed"})
+            );
+            Ok(Bytes::from(output))
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "keep-alive")
+        .body(Body::from_stream(sse_stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// POST /webhook — main webhook endpoint
+async fn handle_webhook(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        tracing::warn!("/webhook rate limit exceeded");
+        let err = serde_json::json!({
+            "error": "Too many webhook requests. Please retry later.",
+            "retry_after": RATE_LIMIT_WINDOW_SECS,
+        });
+        return (StatusCode::TOO_MANY_REQUESTS, Json(err)).into_response();
+    }
+
     // Require at least one auth layer for non-loopback traffic.
     if !state.pairing.require_pairing()
         && state.webhook_secret_hash.is_none()
         && !peer_addr.ip().is_loopback()
     {
         tracing::warn!(
-            "{endpoint}: rejected unauthenticated non-loopback request (pairing disabled and no webhook secret configured)"
+            "Webhook: rejected unauthenticated non-loopback request (pairing disabled and no webhook secret configured)"
         );
         let err = serde_json::json!({
             "error": "Unauthorized — configure pairing or X-Webhook-Secret for non-local webhook access"
         });
-        return Err((StatusCode::UNAUTHORIZED, err));
+        return (StatusCode::UNAUTHORIZED, Json(err)).into_response();
     }
 
-    // Bearer token auth (pairing)
+    // ── Bearer token auth (pairing) ──
     if state.pairing.require_pairing() {
         let auth = headers
             .get(header::AUTHORIZATION)
@@ -1201,15 +1461,15 @@ fn enforce_gateway_auth(
             .unwrap_or("");
         let token = auth.strip_prefix("Bearer ").unwrap_or("");
         if !state.pairing.is_authenticated(token) {
-            tracing::warn!("{endpoint}: rejected — not paired / invalid bearer token");
+            tracing::warn!("Webhook: rejected — not paired / invalid bearer token");
             let err = serde_json::json!({
                 "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
             });
-            return Err((StatusCode::UNAUTHORIZED, err));
+            return (StatusCode::UNAUTHORIZED, Json(err)).into_response();
         }
     }
 
-    // Optional shared secret auth for webhook-style clients.
+    // ── Webhook secret auth (optional, additional layer) ──
     if let Some(ref secret_hash) = state.webhook_secret_hash {
         let header_hash = headers
             .get("X-Webhook-Secret")
@@ -1220,101 +1480,11 @@ fn enforce_gateway_auth(
         match header_hash {
             Some(val) if constant_time_eq(&val, secret_hash.as_ref()) => {}
             _ => {
-                tracing::warn!(
-                    "{endpoint}: rejected request — invalid or missing X-Webhook-Secret"
-                );
+                tracing::warn!("Webhook: rejected request — invalid or missing X-Webhook-Secret");
                 let err = serde_json::json!({"error": "Unauthorized — invalid or missing X-Webhook-Secret header"});
-                return Err((StatusCode::UNAUTHORIZED, err));
+                return (StatusCode::UNAUTHORIZED, Json(err)).into_response();
             }
         }
-    }
-
-    Ok(())
-}
-
-/// POST /api/chat — tools-enabled chat endpoint for remote integrations.
-///
-/// Request:
-/// `{ "message": "..." }`
-///
-/// Response:
-/// `{ "reply": "..." }`
-async fn handle_api_chat(
-    State(state): State<AppState>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    body: Result<Json<ApiChatBody>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
-    let rate_key =
-        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
-    if !state.rate_limiter.allow_webhook(&rate_key) {
-        tracing::warn!("/api/chat rate limit exceeded");
-        let err = serde_json::json!({
-            "error": "Too many chat requests. Please retry later.",
-            "retry_after": RATE_LIMIT_WINDOW_SECS,
-        });
-        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
-    }
-
-    if let Err((status, err)) = enforce_gateway_auth(&state, peer_addr, &headers, "/api/chat") {
-        return (status, Json(err));
-    }
-
-    let Json(chat_body) = match body {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!("/api/chat JSON parse error: {e}");
-            let err = serde_json::json!({
-                "error": "Invalid JSON body. Expected: {\"message\": \"...\"}"
-            });
-            return (StatusCode::BAD_REQUEST, Json(err));
-        }
-    };
-
-    if state.auto_save {
-        let key = api_chat_memory_key();
-        let _ = state
-            .mem
-            .store(&key, &chat_body.message, MemoryCategory::Conversation, None)
-            .await;
-    }
-
-    match run_gateway_chat_with_tools(&state, &chat_body.message).await {
-        Ok(response) => {
-            let safe_response =
-                sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
-            let body = serde_json::json!({ "reply": safe_response });
-            (StatusCode::OK, Json(body))
-        }
-        Err(e) => {
-            let sanitized = providers::sanitize_api_error(&e.to_string());
-            tracing::error!("/api/chat provider error: {}", sanitized);
-            let err = serde_json::json!({"error": "LLM request failed"});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
-        }
-    }
-}
-
-/// POST /webhook — main webhook endpoint
-async fn handle_webhook(
-    State(state): State<AppState>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
-    let rate_key =
-        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
-    if !state.rate_limiter.allow_webhook(&rate_key) {
-        tracing::warn!("/webhook rate limit exceeded");
-        let err = serde_json::json!({
-            "error": "Too many webhook requests. Please retry later.",
-            "retry_after": RATE_LIMIT_WINDOW_SECS,
-        });
-        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
-    }
-
-    if let Err((status, err)) = enforce_gateway_auth(&state, peer_addr, &headers, "/webhook") {
-        return (status, Json(err));
     }
 
     // ── Parse body ──
@@ -1325,7 +1495,7 @@ async fn handle_webhook(
             let err = serde_json::json!({
                 "error": "Invalid JSON body. Expected: {\"message\": \"...\"}"
             });
-            return (StatusCode::BAD_REQUEST, Json(err));
+            return (StatusCode::BAD_REQUEST, Json(err)).into_response();
         }
     };
 
@@ -1343,11 +1513,17 @@ async fn handle_webhook(
                 "idempotent": true,
                 "message": "Request already processed for this idempotency key"
             });
-            return (StatusCode::OK, Json(body));
+            return (StatusCode::OK, Json(body)).into_response();
         }
     }
 
-    let message = &webhook_body.message;
+    let message = webhook_body.message.trim();
+    if message.is_empty() {
+        let err = serde_json::json!({
+            "error": "The `message` field is required and must be a non-empty string."
+        });
+        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+    }
 
     if state.auto_save {
         let key = webhook_memory_key();
@@ -1380,6 +1556,57 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
+    if webhook_body.stream.unwrap_or(false) {
+        let prepared_messages = match prepare_gateway_messages_for_provider(&state, message).await {
+            Ok(messages) => messages,
+            Err(e) => {
+                let duration = started_at.elapsed();
+                let sanitized = providers::sanitize_api_error(&e.to_string());
+                state
+                    .observer
+                    .record_event(&crate::observability::ObserverEvent::LlmResponse {
+                        provider: provider_label.clone(),
+                        model: model_label.clone(),
+                        duration,
+                        success: false,
+                        error_message: Some(sanitized.clone()),
+                        input_tokens: None,
+                        output_tokens: None,
+                    });
+                state.observer.record_metric(
+                    &crate::observability::traits::ObserverMetric::RequestLatency(duration),
+                );
+                state
+                    .observer
+                    .record_event(&crate::observability::ObserverEvent::Error {
+                        component: "gateway".to_string(),
+                        message: sanitized.clone(),
+                    });
+                state
+                    .observer
+                    .record_event(&crate::observability::ObserverEvent::AgentEnd {
+                        provider: provider_label,
+                        model: model_label,
+                        duration,
+                        tokens_used: None,
+                        cost_usd: None,
+                    });
+
+                tracing::error!("Webhook streaming setup failed: {}", sanitized);
+                let err = serde_json::json!({"error": "LLM request failed"});
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response();
+            }
+        };
+
+        return handle_webhook_streaming(
+            state,
+            prepared_messages,
+            provider_label,
+            model_label,
+            started_at,
+        );
+    }
+
     match run_gateway_chat_simple(&state, message).await {
         Ok(response) => {
             let safe_response =
@@ -1410,7 +1637,7 @@ async fn handle_webhook(
                 });
 
             let body = serde_json::json!({"response": safe_response, "model": state.model});
-            (StatusCode::OK, Json(body))
+            (StatusCode::OK, Json(body)).into_response()
         }
         Err(e) => {
             let duration = started_at.elapsed();
@@ -1448,7 +1675,7 @@ async fn handle_webhook(
 
             tracing::error!("Webhook provider error: {}", sanitized);
             let err = serde_json::json!({"error": "LLM request failed"});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response()
         }
     }
 }
@@ -2062,11 +2289,30 @@ mod tests {
         let valid = r#"{"message": "hello"}"#;
         let parsed: Result<WebhookBody, _> = serde_json::from_str(valid);
         assert!(parsed.is_ok());
-        assert_eq!(parsed.unwrap().message, "hello");
+        let parsed = parsed.unwrap();
+        assert_eq!(parsed.message, "hello");
+        assert_eq!(parsed.stream, None);
+
+        let stream_enabled = r#"{"message": "hello", "stream": true}"#;
+        let parsed: Result<WebhookBody, _> = serde_json::from_str(stream_enabled);
+        assert!(parsed.is_ok());
+        assert_eq!(parsed.unwrap().stream, Some(true));
 
         let missing = r#"{"other": "field"}"#;
         let parsed: Result<WebhookBody, _> = serde_json::from_str(missing);
         assert!(parsed.is_err());
+    }
+
+    #[tokio::test]
+    async fn webhook_get_usage_returns_explicit_method_hint() {
+        let response = handle_webhook_usage().await.into_response();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["method"], "POST");
+        assert_eq!(parsed["path"], "/webhook");
+        assert_eq!(parsed["example"]["message"], "Hello from webhook");
     }
 
     #[test]
@@ -2744,6 +2990,7 @@ Reminder set successfully."#;
 
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
+            stream: None,
         }));
         let first = handle_webhook(
             State(state.clone()),
@@ -2757,6 +3004,7 @@ Reminder set successfully."#;
 
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
+            stream: None,
         }));
         let second = handle_webhook(State(state), test_connect_info(), headers, body)
             .await
@@ -2768,114 +3016,6 @@ Reminder set successfully."#;
         assert_eq!(parsed["status"], "duplicate");
         assert_eq!(parsed["idempotent"], true);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn api_chat_rejects_invalid_bearer_when_pairing_required() {
-        let provider_impl = Arc::new(MockProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
-        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
-
-        let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            provider,
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: memory,
-            auto_save: false,
-            webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(true, &["valid-token".into()])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
-            qq: None,
-            qq_webhook_enabled: false,
-            observer: Arc::new(crate::observability::NoopObserver),
-            tools_registry: Arc::new(Vec::new()),
-            tools_registry_exec: Arc::new(Vec::new()),
-            multimodal: crate::config::MultimodalConfig::default(),
-            max_tool_iterations: 10,
-            cost_tracker: None,
-            event_tx: tokio::sync::broadcast::channel(16).0,
-        };
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer invalid-token"),
-        );
-
-        let response = handle_api_chat(
-            State(state),
-            test_connect_info(),
-            headers,
-            Ok(Json(ApiChatBody {
-                message: "hello".into(),
-            })),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn api_chat_rejects_public_traffic_without_auth_layers() {
-        let provider_impl = Arc::new(MockProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
-        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
-
-        let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            provider,
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: memory,
-            auto_save: false,
-            webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
-            qq: None,
-            qq_webhook_enabled: false,
-            observer: Arc::new(crate::observability::NoopObserver),
-            tools_registry: Arc::new(Vec::new()),
-            tools_registry_exec: Arc::new(Vec::new()),
-            multimodal: crate::config::MultimodalConfig::default(),
-            max_tool_iterations: 10,
-            cost_tracker: None,
-            event_tx: tokio::sync::broadcast::channel(16).0,
-        };
-
-        let response = handle_api_chat(
-            State(state),
-            test_public_connect_info(),
-            HeaderMap::new(),
-            Ok(Json(ApiChatBody {
-                message: "hello from api chat".into(),
-            })),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -2920,12 +3060,127 @@ Reminder set successfully."#;
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                stream: None,
             })),
         )
         .await
         .into_response();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_empty_message() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "   ".into(),
+                stream: None,
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn webhook_stream_response_uses_sse_content_type() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            qq: None,
+            qq_webhook_enabled: false,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_exec: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 10,
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+        };
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "stream me".into(),
+                stream: Some(true),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(content_type.starts_with("text/event-stream"));
+
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&payload);
+        assert!(text.contains("data: [DONE]"));
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -3080,6 +3335,7 @@ Reminder set successfully."#;
 
         let body1 = Ok(Json(WebhookBody {
             message: "hello one".into(),
+            stream: None,
         }));
         let first = handle_webhook(
             State(state.clone()),
@@ -3093,6 +3349,7 @@ Reminder set successfully."#;
 
         let body2 = Ok(Json(WebhookBody {
             message: "hello two".into(),
+            stream: None,
         }));
         let second = handle_webhook(State(state), test_connect_info(), headers, body2)
             .await
@@ -3163,6 +3420,7 @@ Reminder set successfully."#;
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                stream: None,
             })),
         )
         .await
@@ -3222,6 +3480,7 @@ Reminder set successfully."#;
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                stream: None,
             })),
         )
         .await
@@ -3277,6 +3536,7 @@ Reminder set successfully."#;
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                stream: None,
             })),
         )
         .await

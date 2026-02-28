@@ -6,6 +6,7 @@ use directories::UserDirs;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 #[cfg(unix)]
@@ -252,6 +253,10 @@ pub struct Config {
     #[serde(default)]
     pub hooks: HooksConfig,
 
+    /// Plugin system configuration (discovery, loading, per-plugin config).
+    #[serde(default)]
+    pub plugins: PluginsConfig,
+
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
@@ -264,12 +269,20 @@ pub struct Config {
     #[serde(default)]
     pub agents_ipc: AgentsIpcConfig,
 
+    /// External MCP server connections (`[mcp]`).
+    #[serde(default, alias = "mcpServers")]
+    pub mcp: McpConfig,
+
     /// Vision support override for the active provider/model.
     /// - `None` (default): use provider's built-in default
     /// - `Some(true)`: force vision support on (e.g. Ollama running llava)
     /// - `Some(false)`: force vision support off
     #[serde(default)]
     pub model_support_vision: Option<bool>,
+
+    /// WASM plugin engine configuration (`[wasm]` section).
+    #[serde(default)]
+    pub wasm: WasmConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -495,6 +508,11 @@ pub struct TranscriptionConfig {
     /// Enable voice transcription for channels that support it.
     #[serde(default)]
     pub enabled: bool,
+    /// API key used for transcription requests.
+    ///
+    /// If unset, runtime falls back to `GROQ_API_KEY` for backward compatibility.
+    #[serde(default)]
+    pub api_key: Option<String>,
     /// Whisper API endpoint URL.
     #[serde(default = "default_transcription_api_url")]
     pub api_url: String,
@@ -513,12 +531,67 @@ impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            api_key: None,
             api_url: default_transcription_api_url(),
             model: default_transcription_model(),
             language: None,
             max_duration_secs: default_transcription_max_duration_secs(),
         }
     }
+}
+
+// ── MCP ─────────────────────────────────────────────────────────
+
+/// Transport type for MCP server connections.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    /// Spawn a local process and communicate over stdin/stdout.
+    #[default]
+    Stdio,
+    /// Connect via HTTP POST.
+    Http,
+    /// Connect via HTTP + Server-Sent Events.
+    Sse,
+}
+
+/// Configuration for a single external MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct McpServerConfig {
+    /// Display name used as a tool prefix (`<server>__<tool>`).
+    pub name: String,
+    /// Transport type (default: stdio).
+    #[serde(default)]
+    pub transport: McpTransport,
+    /// URL for HTTP/SSE transports.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Executable to spawn for stdio transport.
+    #[serde(default)]
+    pub command: String,
+    /// Command arguments for stdio transport.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Optional environment variables for stdio transport.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Optional HTTP headers for HTTP/SSE transports.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Optional per-call timeout in seconds (hard capped in validation).
+    #[serde(default)]
+    pub tool_timeout_secs: Option<u64>,
+}
+
+/// External MCP client configuration (`[mcp]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct McpConfig {
+    /// Enable MCP tool loading.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Configured MCP servers.
+    #[serde(default, alias = "mcpServers")]
+    pub servers: Vec<McpServerConfig>,
 }
 
 // ── Agents IPC ──────────────────────────────────────────────────
@@ -658,7 +731,7 @@ fn default_agent_tool_dispatcher() -> String {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            compact_context: false,
+            compact_context: true,
             max_tool_iterations: default_agent_max_tool_iterations(),
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
@@ -697,10 +770,66 @@ pub struct SkillsConfig {
     /// If unset, defaults to `$HOME/open-skills` when enabled.
     #[serde(default)]
     pub open_skills_dir: Option<String>,
+    /// Allow script-like files in skills (`.sh`, `.bash`, `.ps1`, shebang shell files).
+    /// Default: `false` (secure by default).
+    #[serde(default)]
+    pub allow_scripts: bool,
     /// Controls how skills are injected into the system prompt.
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
+    /// Optional ClawhHub API token for authenticated skill downloads.
+    /// Obtain from https://clawhub.ai after signing in.
+    /// Set via config: `clawhub_token = "..."` under `[skills]`.
+    #[serde(default)]
+    pub clawhub_token: Option<String>,
+}
+
+/// WASM plugin engine configuration (`[wasm]` section).
+///
+/// Controls limits applied to every WASM tool invocation.
+/// Requires the `wasm-tools` compile-time feature to have any effect.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WasmConfig {
+    /// Enable loading WASM tools from installed skill packages.
+    /// Default: `true` (auto-discovers plugins in the skills directory).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Maximum linear memory per WASM invocation in MiB.
+    /// Valid range: 1..=256. Default: `64`.
+    #[serde(default = "default_wasm_memory_limit_mb")]
+    pub memory_limit_mb: u64,
+    /// CPU fuel budget per invocation (roughly one unit ≈ one WASM instruction).
+    /// Default: 1_000_000_000.
+    #[serde(default = "default_wasm_fuel_limit")]
+    pub fuel_limit: u64,
+    /// URL of the ZeroMarket (or compatible) registry used by `zeroclaw skill install`.
+    /// Default: the public ZeroMarket registry.
+    #[serde(default = "default_registry_url")]
+    pub registry_url: String,
+}
+
+fn default_wasm_memory_limit_mb() -> u64 {
+    64
+}
+
+fn default_wasm_fuel_limit() -> u64 {
+    1_000_000_000
+}
+
+fn default_registry_url() -> String {
+    "https://zeromarket.vercel.app/api".to_string()
+}
+
+impl Default for WasmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            memory_limit_mb: default_wasm_memory_limit_mb(),
+            fuel_limit: default_wasm_fuel_limit(),
+            registry_url: default_registry_url(),
+        }
+    }
 }
 
 /// Multimodal (image) handling configuration (`[multimodal]` section).
@@ -754,6 +883,11 @@ pub struct IdentityConfig {
     /// Identity format: "openclaw" (default) or "aieos"
     #[serde(default = "default_identity_format")]
     pub format: String,
+    /// Additional workspace files injected for the OpenClaw identity format.
+    ///
+    /// Paths are resolved relative to the workspace root.
+    #[serde(default)]
+    pub extra_files: Vec<String>,
     /// Path to AIEOS JSON file (relative to workspace)
     #[serde(default)]
     pub aieos_path: Option<String>,
@@ -770,6 +904,7 @@ impl Default for IdentityConfig {
     fn default() -> Self {
         Self {
             format: default_identity_format(),
+            extra_files: Vec::new(),
             aieos_path: None,
             aieos_inline: None,
         }
@@ -1306,10 +1441,11 @@ pub struct WebFetchConfig {
     /// Enable `web_fetch` tool for fetching web page content
     #[serde(default)]
     pub enabled: bool,
-    /// Provider: "fast_html2md", "nanohtml2text", or "firecrawl"
+    /// Provider: "fast_html2md", "nanohtml2text", "firecrawl", or "tavily"
     #[serde(default = "default_web_fetch_provider")]
     pub provider: String,
-    /// Optional provider API key (required for provider = "firecrawl")
+    /// Optional provider API key (required for provider = "firecrawl" or "tavily").
+    /// Multiple keys can be comma-separated for round-robin load balancing.
     #[serde(default)]
     pub api_key: Option<String>,
     /// Optional provider API URL override (for self-hosted providers)
@@ -1368,10 +1504,11 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default)]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free, no API key) or "brave" (requires API key)
+    /// Search provider: "duckduckgo" (free, no API key), "brave", "firecrawl", or "tavily"
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
-    /// Generic provider API key (used by firecrawl and as fallback for brave)
+    /// Generic provider API key (used by firecrawl, tavily, and as fallback for brave).
+    /// Multiple keys can be comma-separated for round-robin load balancing.
     #[serde(default)]
     pub api_key: Option<String>,
     /// Optional provider API URL override (for self-hosted providers)
@@ -1732,6 +1869,29 @@ fn validate_proxy_url(field: &str, url: &str) -> Result<()> {
     Ok(())
 }
 
+fn parse_cidr_notation(raw: &str) -> Result<(IpAddr, u8)> {
+    let (ip_raw, prefix_raw) = raw
+        .trim()
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("missing '/' separator"))?;
+    let ip: IpAddr = ip_raw
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid IP address '{ip_raw}'"))?;
+    let prefix: u8 = prefix_raw
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid prefix '{prefix_raw}'"))?;
+    let max_prefix = match ip {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    if prefix > max_prefix {
+        anyhow::bail!("prefix {prefix} exceeds max {max_prefix} for {ip}");
+    }
+    Ok((ip, prefix))
+}
+
 fn set_proxy_env_pair(key: &str, value: Option<&str>) {
     let lowercase_key = key.to_ascii_lowercase();
     if let Some(value) = value.and_then(|candidate| normalize_proxy_url_option(Some(candidate))) {
@@ -1968,7 +2128,7 @@ impl Default for StorageProviderConfig {
 /// Controls conversation memory storage, embeddings, hybrid search, response caching,
 /// and memory snapshot/hydration.
 /// Configuration for Qdrant vector database backend (`[memory.qdrant]`).
-/// Used when `[memory].backend = "qdrant"`.
+/// Used when `[memory].backend = "qdrant"` or `"sqlite_qdrant_hybrid"`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct QdrantConfig {
     /// Qdrant server URL (e.g. "http://localhost:6333").
@@ -2002,10 +2162,10 @@ impl Default for QdrantConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
-    /// "sqlite" | "lucid" | "postgres" | "qdrant" | "markdown" | "none" (`none` = explicit no-op memory)
+    /// "sqlite" | "sqlite_qdrant_hybrid" | "lucid" | "postgres" | "qdrant" | "markdown" | "none" (`none` = explicit no-op memory)
     ///
     /// `postgres` requires `[storage.provider.config]` with `db_url` (`dbURL` alias supported).
-    /// `qdrant` uses `[memory.qdrant]` config or `QDRANT_URL` env var.
+    /// `qdrant` and `sqlite_qdrant_hybrid` use `[memory.qdrant]` config or `QDRANT_URL` env var.
     pub backend: String,
     /// Auto-save user-stated conversation input to memory (assistant output is excluded)
     pub auto_save: bool,
@@ -2078,7 +2238,7 @@ pub struct MemoryConfig {
 
     // ── Qdrant backend options ─────────────────────────────────
     /// Configuration for Qdrant vector database backend.
-    /// Only used when `backend = "qdrant"`.
+    /// Used when `backend = "qdrant"` or `backend = "sqlite_qdrant_hybrid"`.
     #[serde(default)]
     pub qdrant: QdrantConfig,
 }
@@ -2238,6 +2398,87 @@ pub struct BuiltinHooksConfig {
     pub command_logger: bool,
 }
 
+// ── Plugin system ─────────────────────────────────────────────────────────────
+
+/// Plugin system configuration (`[plugins]` section).
+///
+/// Controls plugin discovery, loading, and per-plugin settings.
+/// Mirrors OpenClaw's `plugins` config block.
+///
+/// Example:
+/// ```toml
+/// [plugins]
+/// enabled = true
+/// allow = ["hello-world"]
+///
+/// [plugins.entries.hello-world]
+/// enabled = true
+///
+/// [plugins.entries.hello-world.config]
+/// greeting = "Howdy"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PluginsConfig {
+    /// Master switch — set to `false` to disable all plugin loading. Default: `true`.
+    #[serde(default = "default_plugins_enabled")]
+    pub enabled: bool,
+
+    /// Allowlist — if non-empty, only plugins with these IDs are loaded.
+    /// An empty list means all discovered plugins are eligible.
+    #[serde(default)]
+    pub allow: Vec<String>,
+
+    /// Denylist — plugins with these IDs are never loaded, even if in the allowlist.
+    #[serde(default)]
+    pub deny: Vec<String>,
+
+    /// Extra directories to scan for plugins (in addition to the standard locations).
+    /// Standard locations: `<binary_dir>/extensions/`, `~/.zeroclaw/extensions/`,
+    /// `<workspace>/.zeroclaw/extensions/`.
+    #[serde(default)]
+    pub load_paths: Vec<String>,
+
+    /// Per-plugin configuration entries.
+    #[serde(default)]
+    pub entries: std::collections::HashMap<String, PluginEntryConfig>,
+}
+
+fn default_plugins_enabled() -> bool {
+    true
+}
+
+impl Default for PluginsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow: Vec::new(),
+            deny: Vec::new(),
+            load_paths: Vec::new(),
+            entries: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Per-plugin configuration entry (`[plugins.entries.<id>]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PluginEntryConfig {
+    /// Override the plugin's enabled state. If absent, the plugin is enabled
+    /// unless it is bundled-and-disabled-by-default.
+    pub enabled: Option<bool>,
+
+    /// Plugin-specific configuration table, passed to `PluginApi::plugin_config()`.
+    #[serde(default)]
+    pub config: serde_json::Value,
+}
+
+impl Default for PluginEntryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            config: serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
+}
 // ── Autonomy / Security ──────────────────────────────────────────
 
 /// Natural-language behavior for non-CLI approval-management commands.
@@ -2524,11 +2765,11 @@ pub struct WasmRuntimeConfig {
     pub tools_dir: String,
 
     /// Fuel limit per invocation (instruction budget).
-    #[serde(default = "default_wasm_fuel_limit")]
+    #[serde(default = "default_runtime_wasm_fuel_limit")]
     pub fuel_limit: u64,
 
     /// Memory limit per invocation in MB.
-    #[serde(default = "default_wasm_memory_limit_mb")]
+    #[serde(default = "default_runtime_wasm_memory_limit_mb")]
     pub memory_limit_mb: u64,
 
     /// Maximum `.wasm` module size in MB.
@@ -2633,11 +2874,11 @@ fn default_wasm_tools_dir() -> String {
     "tools/wasm".into()
 }
 
-fn default_wasm_fuel_limit() -> u64 {
+fn default_runtime_wasm_fuel_limit() -> u64 {
     1_000_000
 }
 
-fn default_wasm_memory_limit_mb() -> u64 {
+fn default_runtime_wasm_memory_limit_mb() -> u64 {
     64
 }
 
@@ -2663,8 +2904,8 @@ impl Default for WasmRuntimeConfig {
     fn default() -> Self {
         Self {
             tools_dir: default_wasm_tools_dir(),
-            fuel_limit: default_wasm_fuel_limit(),
-            memory_limit_mb: default_wasm_memory_limit_mb(),
+            fuel_limit: default_runtime_wasm_fuel_limit(),
+            memory_limit_mb: default_runtime_wasm_memory_limit_mb(),
             max_module_size_mb: default_wasm_max_module_size_mb(),
             allow_workspace_read: false,
             allow_workspace_write: false,
@@ -4117,6 +4358,10 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub otp: OtpConfig,
 
+    /// Custom security role definitions used for user-level tool authorization.
+    #[serde(default)]
+    pub roles: Vec<SecurityRoleConfig>,
+
     /// Emergency-stop state machine configuration.
     #[serde(default)]
     pub estop: EstopConfig,
@@ -4124,6 +4369,99 @@ pub struct SecurityConfig {
     /// Syscall anomaly detection profile for daemon shell/process execution.
     #[serde(default)]
     pub syscall_anomaly: SyscallAnomalyConfig,
+
+    /// Lightweight statistical filter for adversarial suffixes (opt-in).
+    #[serde(default)]
+    pub perplexity_filter: PerplexityFilterConfig,
+
+    /// Shared URL access policy for network-enabled tools.
+    #[serde(default)]
+    pub url_access: UrlAccessConfig,
+}
+
+/// Lightweight perplexity-style filter configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PerplexityFilterConfig {
+    /// Enable probabilistic adversarial suffix filtering before provider calls.
+    #[serde(default)]
+    pub enable_perplexity_filter: bool,
+
+    /// Character-class bigram perplexity threshold for anomaly blocking.
+    #[serde(default = "default_perplexity_threshold")]
+    pub perplexity_threshold: f64,
+
+    /// Number of trailing characters sampled for suffix anomaly scoring.
+    #[serde(default = "default_perplexity_suffix_window_chars")]
+    pub suffix_window_chars: usize,
+
+    /// Minimum input length before running the perplexity filter.
+    #[serde(default = "default_perplexity_min_prompt_chars")]
+    pub min_prompt_chars: usize,
+
+    /// Minimum punctuation ratio in the sampled suffix required to block.
+    #[serde(default = "default_perplexity_symbol_ratio_threshold")]
+    pub symbol_ratio_threshold: f64,
+}
+
+fn default_perplexity_threshold() -> f64 {
+    18.0
+}
+
+fn default_perplexity_suffix_window_chars() -> usize {
+    64
+}
+
+fn default_perplexity_min_prompt_chars() -> usize {
+    32
+}
+
+fn default_perplexity_symbol_ratio_threshold() -> f64 {
+    0.20
+}
+
+impl Default for PerplexityFilterConfig {
+    fn default() -> Self {
+        Self {
+            enable_perplexity_filter: false,
+            perplexity_threshold: default_perplexity_threshold(),
+            suffix_window_chars: default_perplexity_suffix_window_chars(),
+            min_prompt_chars: default_perplexity_min_prompt_chars(),
+            symbol_ratio_threshold: default_perplexity_symbol_ratio_threshold(),
+        }
+    }
+}
+
+/// Shared URL validation configuration used by network tools.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UrlAccessConfig {
+    /// Block private/local IPs and hostnames by default.
+    #[serde(default = "default_true")]
+    pub block_private_ip: bool,
+
+    /// Explicit CIDR ranges that bypass private/local-IP blocking.
+    #[serde(default)]
+    pub allow_cidrs: Vec<String>,
+
+    /// Explicit domain patterns that bypass private/local-IP blocking.
+    /// Supports exact, `*.example.com`, and `*`.
+    #[serde(default)]
+    pub allow_domains: Vec<String>,
+
+    /// Allow loopback host/IP access (`localhost`, `127.0.0.1`, `::1`).
+    #[serde(default)]
+    pub allow_loopback: bool,
+}
+
+impl Default for UrlAccessConfig {
+    fn default() -> Self {
+        Self {
+            block_private_ip: true,
+            allow_cidrs: Vec::new(),
+            allow_domains: Vec::new(),
+            allow_loopback: false,
+        }
+    }
 }
 
 /// OTP validation strategy.
@@ -4139,12 +4477,25 @@ pub enum OtpMethod {
     CliPrompt,
 }
 
+/// Channel delivery mode for OTP challenges.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum OtpChallengeDelivery {
+    /// Send OTP challenge in direct message/private channel.
+    #[default]
+    Dm,
+    /// Send OTP challenge in thread where supported.
+    Thread,
+    /// Send OTP challenge as ephemeral message where supported.
+    Ephemeral,
+}
+
 /// Security OTP configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OtpConfig {
-    /// Enable OTP gating. Defaults to disabled for backward compatibility.
-    #[serde(default)]
+    /// Enable OTP gating. Defaults to enabled.
+    #[serde(default = "default_otp_enabled")]
     pub enabled: bool,
 
     /// OTP method.
@@ -4170,6 +4521,58 @@ pub struct OtpConfig {
     /// Domain-category presets expanded into `gated_domains`.
     #[serde(default)]
     pub gated_domain_categories: Vec<String>,
+
+    /// Delivery mode for OTP challenge prompts in chat channels.
+    #[serde(default)]
+    pub challenge_delivery: OtpChallengeDelivery,
+
+    /// Maximum time a challenge remains valid, in seconds.
+    #[serde(default = "default_otp_challenge_timeout_secs")]
+    pub challenge_timeout_secs: u64,
+
+    /// Maximum OTP attempts allowed per challenge.
+    #[serde(default = "default_otp_challenge_max_attempts")]
+    pub challenge_max_attempts: u8,
+}
+
+/// Custom role definition for user-level authorization.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityRoleConfig {
+    /// Stable role name used by user records.
+    pub name: String,
+
+    /// Optional human-readable description.
+    #[serde(default)]
+    pub description: String,
+
+    /// Explicit allowlist of tools for this role.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+
+    /// Explicit denylist of tools for this role.
+    #[serde(default)]
+    pub denied_tools: Vec<String>,
+
+    /// Tool names requiring OTP for this role.
+    #[serde(default)]
+    pub totp_gated: Vec<String>,
+
+    /// Optional parent role name used for inheritance.
+    #[serde(default)]
+    pub inherits: Option<String>,
+
+    /// Role-scoped domain patterns requiring OTP.
+    #[serde(default)]
+    pub gated_domains: Vec<String>,
+
+    /// Role-scoped domain categories requiring OTP.
+    #[serde(default)]
+    pub gated_domain_categories: Vec<String>,
+}
+
+fn default_otp_enabled() -> bool {
+    true
 }
 
 fn default_otp_token_ttl_secs() -> u64 {
@@ -4178,6 +4581,14 @@ fn default_otp_token_ttl_secs() -> u64 {
 
 fn default_otp_cache_valid_secs() -> u64 {
     300
+}
+
+fn default_otp_challenge_timeout_secs() -> u64 {
+    120
+}
+
+fn default_otp_challenge_max_attempts() -> u8 {
+    3
 }
 
 fn default_otp_gated_actions() -> Vec<String> {
@@ -4193,13 +4604,16 @@ fn default_otp_gated_actions() -> Vec<String> {
 impl Default for OtpConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_otp_enabled(),
             method: OtpMethod::Totp,
             token_ttl_secs: default_otp_token_ttl_secs(),
             cache_valid_secs: default_otp_cache_valid_secs(),
             gated_actions: default_otp_gated_actions(),
             gated_domains: Vec::new(),
             gated_domain_categories: Vec::new(),
+            challenge_delivery: OtpChallengeDelivery::Dm,
+            challenge_timeout_secs: default_otp_challenge_timeout_secs(),
+            challenge_max_attempts: default_otp_challenge_max_attempts(),
         }
     }
 }
@@ -4538,6 +4952,15 @@ pub enum QQReceiveMode {
     Webhook,
 }
 
+/// QQ API environment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum QQEnvironment {
+    #[default]
+    Production,
+    Sandbox,
+}
+
 /// QQ Official Bot configuration (Tencent QQ Bot SDK)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct QQConfig {
@@ -4551,6 +4974,9 @@ pub struct QQConfig {
     /// Event receive mode: "webhook" (default) or "websocket".
     #[serde(default)]
     pub receive_mode: QQReceiveMode,
+    /// API environment: "production" (default) or "sandbox".
+    #[serde(default)]
+    pub environment: QQEnvironment,
 }
 
 impl ChannelConfig for QQConfig {
@@ -4648,11 +5074,14 @@ impl Default for Config {
             agents: HashMap::new(),
             coordination: CoordinationConfig::default(),
             hooks: HooksConfig::default(),
+            plugins: PluginsConfig::default(),
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
+            mcp: McpConfig::default(),
             model_support_vision: None,
+            wasm: WasmConfig::default(),
         }
     }
 }
@@ -5383,6 +5812,65 @@ fn read_codex_openai_api_key() -> Option<String> {
         .map(ToString::to_string)
 }
 
+const MCP_MAX_TOOL_TIMEOUT_SECS: u64 = 600;
+
+fn validate_mcp_config(config: &McpConfig) -> Result<()> {
+    let mut seen_names = std::collections::HashSet::new();
+    for (i, server) in config.servers.iter().enumerate() {
+        let name = server.name.trim();
+        if name.is_empty() {
+            anyhow::bail!("mcp.servers[{i}].name must not be empty");
+        }
+        if !seen_names.insert(name.to_ascii_lowercase()) {
+            anyhow::bail!("mcp.servers contains duplicate name: {name}");
+        }
+
+        if let Some(timeout) = server.tool_timeout_secs {
+            if timeout == 0 {
+                anyhow::bail!("mcp.servers[{i}].tool_timeout_secs must be greater than 0");
+            }
+            if timeout > MCP_MAX_TOOL_TIMEOUT_SECS {
+                anyhow::bail!(
+                    "mcp.servers[{i}].tool_timeout_secs exceeds max {MCP_MAX_TOOL_TIMEOUT_SECS}"
+                );
+            }
+        }
+
+        match server.transport {
+            McpTransport::Stdio => {
+                if server.command.trim().is_empty() {
+                    anyhow::bail!(
+                        "mcp.servers[{i}] with transport=stdio requires non-empty command"
+                    );
+                }
+            }
+            McpTransport::Http | McpTransport::Sse => {
+                let url = server
+                    .url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "mcp.servers[{i}] with transport={} requires url",
+                            match server.transport {
+                                McpTransport::Http => "http",
+                                McpTransport::Sse => "sse",
+                                McpTransport::Stdio => "stdio",
+                            }
+                        )
+                    })?;
+                let parsed = reqwest::Url::parse(url)
+                    .with_context(|| format!("mcp.servers[{i}].url is not a valid URL"))?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    anyhow::bail!("mcp.servers[{i}].url must use http/https");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Config {
     pub async fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
@@ -5444,6 +5932,11 @@ impl Config {
             config.workspace_dir = workspace_dir;
             let store = crate::security::SecretStore::new(&zeroclaw_dir, config.secrets.encrypt);
             decrypt_optional_secret(&store, &mut config.api_key, "config.api_key")?;
+            decrypt_optional_secret(
+                &store,
+                &mut config.transcription.api_key,
+                "config.transcription.api_key",
+            )?;
             decrypt_optional_secret(
                 &store,
                 &mut config.composio.api_key,
@@ -5735,6 +6228,12 @@ impl Config {
                 "security.otp.cache_valid_secs must be greater than or equal to security.otp.token_ttl_secs"
             );
         }
+        if self.security.otp.challenge_timeout_secs == 0 {
+            anyhow::bail!("security.otp.challenge_timeout_secs must be greater than 0");
+        }
+        if self.security.otp.challenge_max_attempts == 0 {
+            anyhow::bail!("security.otp.challenge_max_attempts must be greater than 0");
+        }
         for (i, action) in self.security.otp.gated_actions.iter().enumerate() {
             let normalized = action.trim();
             if normalized.is_empty() {
@@ -5756,6 +6255,116 @@ impl Config {
         .with_context(|| {
             "Invalid security.otp.gated_domains or security.otp.gated_domain_categories"
         })?;
+        for (i, cidr) in self.security.url_access.allow_cidrs.iter().enumerate() {
+            parse_cidr_notation(cidr).with_context(|| {
+                format!("security.url_access.allow_cidrs[{i}] is invalid CIDR notation: {cidr}")
+            })?;
+        }
+        for (i, domain) in self.security.url_access.allow_domains.iter().enumerate() {
+            let normalized = domain.trim();
+            if normalized.is_empty() {
+                anyhow::bail!("security.url_access.allow_domains[{i}] must not be empty");
+            }
+            if normalized.chars().any(char::is_whitespace) {
+                anyhow::bail!("security.url_access.allow_domains[{i}] must not contain whitespace");
+            }
+        }
+        let built_in_roles = ["owner", "admin", "operator", "viewer", "guest"];
+        let mut custom_role_names = std::collections::HashSet::new();
+        for (i, role) in self.security.roles.iter().enumerate() {
+            let name = role.name.trim();
+            if name.is_empty() {
+                anyhow::bail!("security.roles[{i}].name must not be empty");
+            }
+            if !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                anyhow::bail!("security.roles[{i}].name contains invalid characters: {name}");
+            }
+            let normalized_name = name.to_ascii_lowercase();
+            if built_in_roles
+                .iter()
+                .any(|built_in| built_in == &normalized_name.as_str())
+            {
+                anyhow::bail!(
+                    "security.roles[{i}].name conflicts with built-in role: {normalized_name}"
+                );
+            }
+            if !custom_role_names.insert(normalized_name.clone()) {
+                anyhow::bail!("security.roles contains duplicate role: {normalized_name}");
+            }
+
+            for (tool_idx, tool_name) in role.allowed_tools.iter().enumerate() {
+                let normalized = tool_name.trim();
+                if normalized.is_empty() {
+                    anyhow::bail!(
+                        "security.roles[{i}].allowed_tools[{tool_idx}] must not be empty"
+                    );
+                }
+                if !normalized
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '*')
+                {
+                    anyhow::bail!(
+                        "security.roles[{i}].allowed_tools[{tool_idx}] contains invalid characters: {normalized}"
+                    );
+                }
+            }
+            for (tool_idx, tool_name) in role.denied_tools.iter().enumerate() {
+                let normalized = tool_name.trim();
+                if normalized.is_empty() {
+                    anyhow::bail!("security.roles[{i}].denied_tools[{tool_idx}] must not be empty");
+                }
+                if !normalized
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '*')
+                {
+                    anyhow::bail!(
+                        "security.roles[{i}].denied_tools[{tool_idx}] contains invalid characters: {normalized}"
+                    );
+                }
+            }
+            for (tool_idx, tool_name) in role.totp_gated.iter().enumerate() {
+                let normalized = tool_name.trim();
+                if normalized.is_empty() {
+                    anyhow::bail!("security.roles[{i}].totp_gated[{tool_idx}] must not be empty");
+                }
+                if !normalized
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '*')
+                {
+                    anyhow::bail!(
+                        "security.roles[{i}].totp_gated[{tool_idx}] contains invalid characters: {normalized}"
+                    );
+                }
+            }
+            DomainMatcher::new(&role.gated_domains, &role.gated_domain_categories)
+                .with_context(|| format!("Invalid security.roles[{i}] domain settings"))?;
+            if let Some(parent) = role.inherits.as_deref() {
+                let normalized_parent = parent.trim().to_ascii_lowercase();
+                if normalized_parent.is_empty() {
+                    anyhow::bail!("security.roles[{i}].inherits must not be empty");
+                }
+                if normalized_parent == normalized_name {
+                    anyhow::bail!("security.roles[{i}].inherits must not reference itself");
+                }
+            }
+        }
+        for (i, role) in self.security.roles.iter().enumerate() {
+            if let Some(parent) = role.inherits.as_deref() {
+                let normalized_parent = parent.trim().to_ascii_lowercase();
+                let built_in_exists = built_in_roles
+                    .iter()
+                    .any(|built_in| built_in == &normalized_parent.as_str());
+                let custom_exists = custom_role_names.contains(&normalized_parent);
+                if !built_in_exists && !custom_exists {
+                    anyhow::bail!(
+                        "security.roles[{i}].inherits references unknown role: {normalized_parent}"
+                    );
+                }
+            }
+        }
         if self.security.estop.state_file.trim().is_empty() {
             anyhow::bail!("security.estop.state_file must not be empty");
         }
@@ -5804,6 +6413,22 @@ impl Config {
                     "security.syscall_anomaly.baseline_syscalls[{i}] contains invalid characters: {normalized}"
                 );
             }
+        }
+        if self.security.perplexity_filter.perplexity_threshold <= 1.0 {
+            anyhow::bail!(
+                "security.perplexity_filter.perplexity_threshold must be greater than 1.0"
+            );
+        }
+        if self.security.perplexity_filter.suffix_window_chars < 8 {
+            anyhow::bail!("security.perplexity_filter.suffix_window_chars must be at least 8");
+        }
+        if self.security.perplexity_filter.min_prompt_chars < 8 {
+            anyhow::bail!("security.perplexity_filter.min_prompt_chars must be at least 8");
+        }
+        if !(0.0..=1.0).contains(&self.security.perplexity_filter.symbol_ratio_threshold) {
+            anyhow::bail!(
+                "security.perplexity_filter.symbol_ratio_threshold must be between 0.0 and 1.0"
+            );
         }
 
         // Scheduler
@@ -5922,6 +6547,11 @@ impl Config {
             }
         }
 
+        // MCP
+        if self.mcp.enabled {
+            validate_mcp_config(&self.mcp)?;
+        }
+
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
 
@@ -5940,6 +6570,34 @@ impl Config {
         }
         if self.coordination.max_seen_message_ids == 0 {
             anyhow::bail!("coordination.max_seen_message_ids must be greater than 0");
+        }
+
+        // WASM config
+        if self.wasm.memory_limit_mb == 0 || self.wasm.memory_limit_mb > 256 {
+            anyhow::bail!(
+                "wasm.memory_limit_mb must be between 1 and 256, got {}",
+                self.wasm.memory_limit_mb
+            );
+        }
+        if self.wasm.fuel_limit == 0 {
+            anyhow::bail!("wasm.fuel_limit must be greater than 0");
+        }
+        {
+            let url = &self.wasm.registry_url;
+            // Extract what comes after "https://" and check that the host part
+            // (up to the first '/', '?', '#', or ':') is non-empty.
+            let has_valid_host = url
+                .strip_prefix("https://")
+                .map(|rest| {
+                    let host = rest.split(&['/', '?', '#', ':'][..]).next().unwrap_or("");
+                    !host.is_empty()
+                })
+                .unwrap_or(false);
+            if !has_valid_host {
+                anyhow::bail!(
+                    "wasm.registry_url must be a valid HTTPS URL with a non-empty host, got '{url}'"
+                );
+            }
         }
 
         Ok(())
@@ -6032,6 +6690,19 @@ impl Config {
             let trimmed = path.trim();
             if !trimmed.is_empty() {
                 self.skills.open_skills_dir = Some(trimmed.to_string());
+            }
+        }
+
+        // Skills script-file audit override: ZEROCLAW_SKILLS_ALLOW_SCRIPTS
+        if let Ok(flag) = std::env::var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS") {
+            if !flag.trim().is_empty() {
+                match flag.trim().to_ascii_lowercase().as_str() {
+                    "1" | "true" | "yes" | "on" => self.skills.allow_scripts = true,
+                    "0" | "false" | "no" | "off" => self.skills.allow_scripts = false,
+                    _ => tracing::warn!(
+                        "Ignoring invalid ZEROCLAW_SKILLS_ALLOW_SCRIPTS (valid: 1|0|true|false|yes|no|on|off)"
+                    ),
+                }
             }
         }
 
@@ -6280,6 +6951,11 @@ impl Config {
         encrypt_optional_secret(&store, &mut config_to_save.api_key, "config.api_key")?;
         encrypt_optional_secret(
             &store,
+            &mut config_to_save.transcription.api_key,
+            "config.transcription.api_key",
+        )?;
+        encrypt_optional_secret(
+            &store,
             &mut config_to_save.composio.api_key,
             "config.composio.api_key",
         )?;
@@ -6484,12 +7160,66 @@ mod tests {
         assert!((c.default_temperature - 0.7).abs() < f64::EPSILON);
         assert!(c.api_key.is_none());
         assert!(!c.skills.open_skills_enabled);
+        assert!(!c.skills.allow_scripts);
         assert_eq!(
             c.skills.prompt_injection_mode,
             SkillsPromptInjectionMode::Full
         );
         assert!(c.workspace_dir.to_string_lossy().contains("workspace"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
+    }
+
+    #[test]
+    async fn wasm_config_default_has_correct_values() {
+        let cfg = WasmConfig::default();
+        assert!(cfg.enabled, "WASM tools should be enabled by default");
+        assert_eq!(cfg.memory_limit_mb, 64);
+        assert_eq!(cfg.fuel_limit, 1_000_000_000);
+        assert_eq!(cfg.registry_url, "https://zeromarket.vercel.app/api");
+    }
+
+    #[test]
+    async fn wasm_config_invalid_values_rejected() {
+        let mut c = Config::default();
+
+        // memory_limit_mb = 0
+        c.wasm.memory_limit_mb = 0;
+        assert!(c.validate().is_err(), "memory_limit_mb=0 should fail");
+
+        // memory_limit_mb = 257
+        c.wasm = WasmConfig::default();
+        c.wasm.memory_limit_mb = 257;
+        assert!(c.validate().is_err(), "memory_limit_mb=257 should fail");
+
+        // fuel_limit = 0
+        c.wasm = WasmConfig::default();
+        c.wasm.fuel_limit = 0;
+        assert!(c.validate().is_err(), "fuel_limit=0 should fail");
+
+        // empty registry_url
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = String::new();
+        assert!(c.validate().is_err(), "empty registry_url should fail");
+
+        // http:// instead of https://
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = "http://example.com".to_string();
+        assert!(c.validate().is_err(), "http registry_url should fail");
+
+        // bare "https://"
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = "https://".to_string();
+        assert!(c.validate().is_err(), "https:// without host should fail");
+
+        // port-only, no hostname
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = "https://:443".to_string();
+        assert!(c.validate().is_err(), "https://:443 should fail");
+
+        // query-only, no hostname
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = "https://?q=1".to_string();
+        assert!(c.validate().is_err(), "https://?q=1 should fail");
     }
 
     #[test]
@@ -6841,6 +7571,7 @@ default_temperature = 0.7
             scheduler: SchedulerConfig::default(),
             coordination: CoordinationConfig::default(),
             skills: SkillsConfig::default(),
+            plugins: PluginsConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
@@ -6908,7 +7639,9 @@ default_temperature = 0.7
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
+            mcp: McpConfig::default(),
             model_support_vision: None,
+            wasm: WasmConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -7182,7 +7915,7 @@ reasoning_level = "high"
     #[test]
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
-        assert!(!cfg.compact_context);
+        assert!(cfg.compact_context);
         assert_eq!(cfg.max_tool_iterations, 20);
         assert_eq!(cfg.max_history_messages, 50);
         assert!(!cfg.parallel_tools);
@@ -7248,6 +7981,7 @@ tool_dispatcher = "xml"
             scheduler: SchedulerConfig::default(),
             coordination: CoordinationConfig::default(),
             skills: SkillsConfig::default(),
+            plugins: PluginsConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
@@ -7276,7 +8010,9 @@ tool_dispatcher = "xml"
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
+            mcp: McpConfig::default(),
             model_support_vision: None,
+            wasm: WasmConfig::default(),
         };
 
         config.save().await.unwrap();
@@ -7309,6 +8045,7 @@ tool_dispatcher = "xml"
         config.workspace_dir = dir.join("workspace");
         config.config_path = dir.join("config.toml");
         config.api_key = Some("root-credential".into());
+        config.transcription.api_key = Some("transcription-credential".into());
         config.composio.api_key = Some("composio-credential".into());
         config.proxy.http_proxy = Some("http://user:pass@proxy.internal:8080".into());
         config.proxy.https_proxy = Some("https://user:pass@proxy.internal:8443".into());
@@ -7355,6 +8092,15 @@ tool_dispatcher = "xml"
         let root_encrypted = stored.api_key.as_deref().unwrap();
         assert!(crate::security::SecretStore::is_encrypted(root_encrypted));
         assert_eq!(store.decrypt(root_encrypted).unwrap(), "root-credential");
+
+        let transcription_encrypted = stored.transcription.api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(
+            transcription_encrypted
+        ));
+        assert_eq!(
+            store.decrypt(transcription_encrypted).unwrap(),
+            "transcription-credential"
+        );
 
         let composio_encrypted = stored.composio.api_key.as_deref().unwrap();
         assert!(crate::security::SecretStore::is_encrypted(
@@ -8498,6 +9244,7 @@ requires_openai_auth = true
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
         assert!(!config.skills.open_skills_enabled);
+        assert!(!config.skills.allow_scripts);
         assert!(config.skills.open_skills_dir.is_none());
         assert_eq!(
             config.skills.prompt_injection_mode,
@@ -8506,10 +9253,12 @@ requires_openai_auth = true
 
         std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "true");
         std::env::set_var("ZEROCLAW_OPEN_SKILLS_DIR", "/tmp/open-skills");
+        std::env::set_var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS", "yes");
         std::env::set_var("ZEROCLAW_SKILLS_PROMPT_MODE", "compact");
         config.apply_env_overrides();
 
         assert!(config.skills.open_skills_enabled);
+        assert!(config.skills.allow_scripts);
         assert_eq!(
             config.skills.open_skills_dir.as_deref(),
             Some("/tmp/open-skills")
@@ -8521,6 +9270,7 @@ requires_openai_auth = true
 
         std::env::remove_var("ZEROCLAW_OPEN_SKILLS_ENABLED");
         std::env::remove_var("ZEROCLAW_OPEN_SKILLS_DIR");
+        std::env::remove_var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS");
         std::env::remove_var("ZEROCLAW_SKILLS_PROMPT_MODE");
     }
 
@@ -8529,18 +9279,22 @@ requires_openai_auth = true
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
         config.skills.open_skills_enabled = true;
+        config.skills.allow_scripts = true;
         config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Compact;
 
         std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "maybe");
+        std::env::set_var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS", "maybe");
         std::env::set_var("ZEROCLAW_SKILLS_PROMPT_MODE", "invalid");
         config.apply_env_overrides();
 
         assert!(config.skills.open_skills_enabled);
+        assert!(config.skills.allow_scripts);
         assert_eq!(
             config.skills.prompt_injection_mode,
             SkillsPromptInjectionMode::Compact
         );
         std::env::remove_var("ZEROCLAW_OPEN_SKILLS_ENABLED");
+        std::env::remove_var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS");
         std::env::remove_var("ZEROCLAW_SKILLS_PROMPT_MODE");
     }
 
@@ -9755,6 +10509,7 @@ default_model = "legacy-model"
         let json = r#"{"app_id":"123","app_secret":"secret"}"#;
         let parsed: QQConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.receive_mode, QQReceiveMode::Webhook);
+        assert_eq!(parsed.environment, QQEnvironment::Production);
         assert!(parsed.allowed_users.is_empty());
     }
 
@@ -9765,10 +10520,12 @@ default_model = "legacy-model"
             app_secret: "secret".into(),
             allowed_users: vec!["*".into()],
             receive_mode: QQReceiveMode::Websocket,
+            environment: QQEnvironment::Sandbox,
         };
         let toml_str = toml::to_string(&qc).unwrap();
         let parsed: QQConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.receive_mode, QQReceiveMode::Websocket);
+        assert_eq!(parsed.environment, QQEnvironment::Sandbox);
         assert_eq!(parsed.allowed_users, vec!["*"]);
     }
 
@@ -9878,6 +10635,7 @@ default_model = "legacy-model"
     async fn transcription_config_defaults() {
         let tc = TranscriptionConfig::default();
         assert!(!tc.enabled);
+        assert!(tc.api_key.is_none());
         assert!(tc.api_url.contains("groq.com"));
         assert_eq!(tc.model, "whisper-large-v3-turbo");
         assert!(tc.language.is_none());
@@ -9888,12 +10646,17 @@ default_model = "legacy-model"
     async fn config_roundtrip_with_transcription() {
         let mut config = Config::default();
         config.transcription.enabled = true;
+        config.transcription.api_key = Some("transcription-key".into());
         config.transcription.language = Some("en".into());
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
 
         assert!(parsed.transcription.enabled);
+        assert_eq!(
+            parsed.transcription.api_key.as_deref(),
+            Some("transcription-key")
+        );
         assert_eq!(parsed.transcription.language.as_deref(), Some("en"));
         assert_eq!(parsed.transcription.model, "whisper-large-v3-turbo");
     }
@@ -9921,13 +10684,25 @@ default_temperature = 0.7
         )
         .unwrap();
 
-        assert!(!parsed.security.otp.enabled);
+        assert!(parsed.security.otp.enabled);
         assert_eq!(parsed.security.otp.method, OtpMethod::Totp);
+        assert_eq!(
+            parsed.security.otp.challenge_delivery,
+            OtpChallengeDelivery::Dm
+        );
+        assert_eq!(parsed.security.otp.challenge_timeout_secs, 120);
+        assert_eq!(parsed.security.otp.challenge_max_attempts, 3);
+        assert!(parsed.security.roles.is_empty());
         assert!(!parsed.security.estop.enabled);
         assert!(parsed.security.estop.require_otp_to_resume);
         assert!(parsed.security.syscall_anomaly.enabled);
         assert!(parsed.security.syscall_anomaly.alert_on_unknown_syscall);
         assert!(!parsed.security.syscall_anomaly.baseline_syscalls.is_empty());
+        assert!(parsed.security.url_access.block_private_ip);
+        assert!(parsed.security.url_access.allow_cidrs.is_empty());
+        assert!(parsed.security.url_access.allow_domains.is_empty());
+        assert!(!parsed.security.url_access.allow_loopback);
+        assert!(!parsed.security.perplexity_filter.enable_perplexity_filter);
     }
 
     #[test]
@@ -9946,6 +10721,19 @@ cache_valid_secs = 120
 gated_actions = ["shell", "browser_open"]
 gated_domains = ["*.chase.com", "accounts.google.com"]
 gated_domain_categories = ["banking"]
+challenge_delivery = "thread"
+challenge_timeout_secs = 180
+challenge_max_attempts = 4
+
+[[security.roles]]
+name = "developer"
+description = "Developer role"
+allowed_tools = ["shell", "file_read", "file_write"]
+denied_tools = ["memory_forget"]
+totp_gated = ["shell", "file_write"]
+inherits = "operator"
+gated_domains = ["*.chase.com"]
+gated_domain_categories = ["banking"]
 
 [security.estop]
 enabled = true
@@ -9962,6 +10750,13 @@ max_alerts_per_minute = 10
 alert_cooldown_secs = 15
 log_path = "syscall-anomalies.log"
 baseline_syscalls = ["read", "write", "openat", "close"]
+
+[security.perplexity_filter]
+enable_perplexity_filter = true
+perplexity_threshold = 16.5
+suffix_window_chars = 72
+min_prompt_chars = 40
+symbol_ratio_threshold = 0.25
 "#,
         )
         .unwrap();
@@ -9980,8 +10775,24 @@ baseline_syscalls = ["read", "write", "openat", "close"]
         assert_eq!(parsed.security.syscall_anomaly.max_alerts_per_minute, 10);
         assert_eq!(parsed.security.syscall_anomaly.alert_cooldown_secs, 15);
         assert_eq!(parsed.security.syscall_anomaly.baseline_syscalls.len(), 4);
+        assert!(parsed.security.perplexity_filter.enable_perplexity_filter);
+        assert_eq!(parsed.security.perplexity_filter.perplexity_threshold, 16.5);
+        assert_eq!(parsed.security.perplexity_filter.suffix_window_chars, 72);
+        assert_eq!(parsed.security.perplexity_filter.min_prompt_chars, 40);
+        assert_eq!(
+            parsed.security.perplexity_filter.symbol_ratio_threshold,
+            0.25
+        );
         assert_eq!(parsed.security.otp.gated_actions.len(), 2);
         assert_eq!(parsed.security.otp.gated_domains.len(), 2);
+        assert_eq!(
+            parsed.security.otp.challenge_delivery,
+            OtpChallengeDelivery::Thread
+        );
+        assert_eq!(parsed.security.otp.challenge_timeout_secs, 180);
+        assert_eq!(parsed.security.otp.challenge_max_attempts, 4);
+        assert_eq!(parsed.security.roles.len(), 1);
+        assert_eq!(parsed.security.roles[0].name, "developer");
         parsed.validate().unwrap();
     }
 
@@ -9992,6 +10803,26 @@ baseline_syscalls = ["read", "write", "openat", "close"]
 
         let err = config.validate().expect_err("expected invalid domain glob");
         assert!(err.to_string().contains("gated_domains"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_invalid_url_access_cidr() {
+        let mut config = Config::default();
+        config.security.url_access.allow_cidrs = vec!["10.0.0.0".into()];
+        let err = config.validate().expect_err("expected invalid CIDR");
+        assert!(err.to_string().contains("security.url_access.allow_cidrs"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_blank_url_access_domain() {
+        let mut config = Config::default();
+        config.security.url_access.allow_domains = vec!["   ".into()];
+        let err = config
+            .validate()
+            .expect_err("expected invalid URL allow domain");
+        assert!(err
+            .to_string()
+            .contains("security.url_access.allow_domains"));
     }
 
     #[test]
@@ -10014,6 +10845,63 @@ baseline_syscalls = ["read", "write", "openat", "close"]
             .validate()
             .expect_err("expected ttl validation failure");
         assert!(err.to_string().contains("token_ttl_secs"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_zero_challenge_timeout() {
+        let mut config = Config::default();
+        config.security.otp.challenge_timeout_secs = 0;
+
+        let err = config
+            .validate()
+            .expect_err("expected challenge timeout validation failure");
+        assert!(err.to_string().contains("challenge_timeout_secs"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_zero_challenge_attempts() {
+        let mut config = Config::default();
+        config.security.otp.challenge_max_attempts = 0;
+
+        let err = config
+            .validate()
+            .expect_err("expected challenge attempts validation failure");
+        assert!(err.to_string().contains("challenge_max_attempts"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_unknown_role_parent() {
+        let mut config = Config::default();
+        config.security.roles = vec![SecurityRoleConfig {
+            name: "developer".to_string(),
+            inherits: Some("missing-parent".to_string()),
+            ..SecurityRoleConfig::default()
+        }];
+
+        let err = config
+            .validate()
+            .expect_err("expected unknown role parent validation failure");
+        assert!(err.to_string().contains("inherits references unknown role"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_duplicate_role_name() {
+        let mut config = Config::default();
+        config.security.roles = vec![
+            SecurityRoleConfig {
+                name: "developer".to_string(),
+                ..SecurityRoleConfig::default()
+            },
+            SecurityRoleConfig {
+                name: "Developer".to_string(),
+                ..SecurityRoleConfig::default()
+            },
+        ];
+
+        let err = config
+            .validate()
+            .expect_err("expected duplicate role validation failure");
+        assert!(err.to_string().contains("duplicate role"));
     }
 
     #[test]
@@ -10073,6 +10961,28 @@ baseline_syscalls = ["read", "write", "openat", "close"]
         assert!(err
             .to_string()
             .contains("max_denied_events_per_minute must be less than or equal"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_invalid_perplexity_threshold() {
+        let mut config = Config::default();
+        config.security.perplexity_filter.perplexity_threshold = 1.0;
+
+        let err = config
+            .validate()
+            .expect_err("expected perplexity threshold validation failure");
+        assert!(err.to_string().contains("perplexity_threshold"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_invalid_perplexity_symbol_ratio_threshold() {
+        let mut config = Config::default();
+        config.security.perplexity_filter.symbol_ratio_threshold = 1.5;
+
+        let err = config
+            .validate()
+            .expect_err("expected perplexity symbol ratio validation failure");
+        assert!(err.to_string().contains("symbol_ratio_threshold"));
     }
 
     #[test]
