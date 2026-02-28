@@ -536,9 +536,9 @@ pub fn build_a2a_routes<D: AgentDispatcher>(state: A2AGatewayState<D>) -> Router
     Router::new()
         .route("/.well-known/agent.json", get(handle_agent_card::<D>))
         .route("/tasks", post(handle_create_task::<D>))
-        .route("/tasks/:id", get(handle_get_task::<D>))
-        .route("/tasks/:id/stream", get(handle_task_stream::<D>))
-        .route("/tasks/:id/cancel", post(handle_cancel_task::<D>))
+        .route("/tasks/{id}", get(handle_get_task::<D>))
+        .route("/tasks/{id}/stream", get(handle_task_stream::<D>))
+        .route("/tasks/{id}/cancel", post(handle_cancel_task::<D>))
         .with_state(state)
 }
 

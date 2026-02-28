@@ -328,8 +328,6 @@ pub struct AppState {
     pub cost_tracker: Option<Arc<CostTracker>>,
     /// SSE broadcast channel for real-time events
     pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
-    /// A2A Protocol
-    pub a2a_tasks: zeroclaw_a2a::TaskStore,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -700,7 +698,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         max_tool_iterations,
         cost_tracker,
         event_tx,
-        a2a_tasks: zeroclaw_a2a::TaskStore::new(),
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -770,16 +767,18 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         // ── Static assets (web dashboard) ──
         .route("/_app/{*path}", get(static_files::handle_static))
 
-        // Google A2A protocol endpoints
-        .route("/.well-known/agent.json", get(a2a::handle_agent_card))
-        .route("/tasks", post(a2a::handle_create_task))
-        .route("/tasks/{id}", get(a2a::handle_get_task))
-        .route("/tasks/{id}/stream", get(a2a::handle_task_stream))
-        .route("/tasks/{id}/cancel", post(a2a::handle_cancel_task))
-
         // ── Config PUT with larger body limit ──
         .merge(config_put_router)
-        .with_state(state)
+        .with_state(state.clone());
+
+    // Google A2A protocol endpoints (merged separately — own state type)
+    let app = if let Some(a2a_router) = a2a::build_a2a_router(&state) {
+        app.merge(a2a_router)
+    } else {
+        app
+    };
+
+    let app = app
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -2381,7 +2380,7 @@ mod tests {
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
-            a2a_tasks: zeroclaw_a2a::TaskStore::new(),
+            
         };
 
         let response = handle_metrics(State(state), test_connect_info(), HeaderMap::new())
@@ -2438,7 +2437,7 @@ mod tests {
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
-            a2a_tasks: zeroclaw_a2a::TaskStore::new(),
+            
         };
 
         let response = handle_metrics(State(state), test_connect_info(), HeaderMap::new())
@@ -2481,7 +2480,7 @@ mod tests {
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
-            a2a_tasks: zeroclaw_a2a::TaskStore::new(),
+            
         };
 
         let response = handle_metrics(State(state), test_public_connect_info(), HeaderMap::new())
@@ -2525,7 +2524,7 @@ mod tests {
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
-            a2a_tasks: zeroclaw_a2a::TaskStore::new(),
+            
         };
 
         let unauthorized =
@@ -2995,7 +2994,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
-            a2a_tasks: zeroclaw_a2a::TaskStore::new(),
+            
         };
 
         let mut headers = HeaderMap::new();
@@ -3065,7 +3064,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
-            a2a_tasks: zeroclaw_a2a::TaskStore::new(),
+            
         };
 
         let response = handle_webhook(
@@ -3117,7 +3116,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
-            a2a_tasks: zeroclaw_a2a::TaskStore::new(),
+            
         };
 
         let response = handle_webhook(
@@ -3170,7 +3169,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
-            a2a_tasks: zeroclaw_a2a::TaskStore::new(),
+            
         };
 
         let response = handle_webhook(
@@ -3232,7 +3231,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
-            a2a_tasks: zeroclaw_a2a::TaskStore::new(),
+            
         };
 
         let response = handle_node_control(
@@ -3287,7 +3286,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
-            a2a_tasks: zeroclaw_a2a::TaskStore::new(),
+            
         };
 
         let response = handle_node_control(
@@ -3347,7 +3346,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
-            a2a_tasks: zeroclaw_a2a::TaskStore::new(),
+            
         };
 
         let headers = HeaderMap::new();
@@ -3431,7 +3430,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
-            a2a_tasks: zeroclaw_a2a::TaskStore::new(),
+            
         };
 
         let response = handle_webhook(
@@ -3486,7 +3485,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
-            a2a_tasks: zeroclaw_a2a::TaskStore::new(),
+            
         };
 
         let mut headers = HeaderMap::new();
@@ -3546,7 +3545,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
-            a2a_tasks: zeroclaw_a2a::TaskStore::new(),
+            
         };
 
         let mut headers = HeaderMap::new();
@@ -3611,7 +3610,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
-            a2a_tasks: zeroclaw_a2a::TaskStore::new(),
+            
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -3671,7 +3670,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
-            a2a_tasks: zeroclaw_a2a::TaskStore::new(),
+            
         };
 
         let mut headers = HeaderMap::new();
@@ -3724,7 +3723,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
-            a2a_tasks: zeroclaw_a2a::TaskStore::new(),
+            
         };
 
         let response = handle_qq_webhook(
@@ -3776,7 +3775,7 @@ Reminder set successfully."#;
             max_tool_iterations: 10,
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
-            a2a_tasks: zeroclaw_a2a::TaskStore::new(),
+            
         };
 
         let mut headers = HeaderMap::new();
