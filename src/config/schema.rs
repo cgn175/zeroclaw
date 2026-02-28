@@ -3505,6 +3505,15 @@ pub struct ChannelsConfig {
     pub message_timeout_secs: u64,
 }
 
+impl ChannelConfig for A2AConfig {
+    fn name() -> &'static str {
+        "A2A Channel"
+    }
+    fn desc() -> &'static str {
+        "Agent2Agent protocol"
+    }
+}
+
 impl ChannelsConfig {
     /// get channels' metadata and `.is_some()`, except webhook
     #[rustfmt::skip]
@@ -3587,6 +3596,10 @@ impl ChannelsConfig {
             (
                 Box::new(ConfigWrapper::new(self.clawdtalk.as_ref())),
                 self.clawdtalk.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(self.a2a.as_ref())),
+                self.a2a.is_some(),
             ),
         ]
     }
