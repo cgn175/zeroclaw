@@ -769,6 +769,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/ws/chat", get(ws::handle_ws_chat))
         // ── Static assets (web dashboard) ──
         .route("/_app/{*path}", get(static_files::handle_static))
+
+        // Google A2A protocol endpoints
+        .route("/.well-known/agent.json", get(a2a::handle_agent_card))
+        .route("/tasks", post(a2a::handle_create_task))
+        .route("/tasks/{id}", get(a2a::handle_get_task))
+        .route("/tasks/{id}/stream", get(a2a::handle_task_stream))
+        .route("/tasks/{id}/cancel", post(a2a::handle_cancel_task))
+
         // ── Config PUT with larger body limit ──
         .merge(config_put_router)
         .with_state(state)
