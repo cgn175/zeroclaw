@@ -977,3 +977,9 @@ time=2026-02-28T01:42:00.129+01:00 level=INFO msg="JSONL file created" path=/Use
 time=2026-02-28T01:42:01.130+01:00 level=INFO msg="Import triggered by file change"
 time=2026-02-28T01:42:01.132+01:00 level=INFO msg="Starting auto-import" mode=auto-import
 time=2026-02-28T01:42:01.236+01:00 level=INFO msg="Pull failed" error="git pull failed: exit status 1\nfatal: 'origin' does not appear to be a git repository\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n" backoff=1m0s
+time=2026-02-28T02:13:10.316+01:00 level=INFO msg="JSONL removed/renamed, re-establishing watch"
+time=2026-02-28T02:13:10.368+01:00 level=INFO msg="Successfully re-established JSONL watch" delay=50ms
+time=2026-02-28T02:13:10.368+01:00 level=INFO msg="JSONL file created" path=/Users/hoangta/projects/zeroclaw/.beads/issues.jsonl
+time=2026-02-28T02:13:11.374+01:00 level=INFO msg="Import triggered by file change"
+time=2026-02-28T02:13:11.375+01:00 level=INFO msg="Starting auto-import" mode=auto-import
+time=2026-02-28T02:13:11.451+01:00 level=INFO msg="Pull failed" error="git pull failed: exit status 1\nfatal: 'origin' does not appear to be a git repository\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n" backoff=2m0s

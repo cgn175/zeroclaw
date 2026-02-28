@@ -182,7 +182,7 @@ pub async fn handle_create_task(
 
     let join_handle = tokio::spawn(async move {
         // Mark as running
-        bg_state.a2a_tasks.update_task(&bg_task_id, |t| {
+        bg_state.a2a_tasks.update_task(&bg_task_id, |t: &mut Task| {
             t.set_status(TaskStatus::Running);
         });
         let _ = bg_update_tx.send(TaskUpdate::status_update(&bg_task_id, TaskStatus::Running));
@@ -191,7 +191,7 @@ pub async fn handle_create_task(
         match crate::gateway::run_gateway_chat_with_tools(&bg_state, &message_content).await {
             Ok(response) => {
                 let agent_msg = TaskMessage::agent(&response);
-                bg_state.a2a_tasks.update_task(&bg_task_id, |t| {
+                bg_state.a2a_tasks.update_task(&bg_task_id, |t: &mut Task| {
                     t.add_message(agent_msg.clone());
                     t.set_status(TaskStatus::Completed);
                 });
@@ -202,7 +202,7 @@ pub async fn handle_create_task(
             }
             Err(e) => {
                 let error_msg = TaskMessage::agent(format!("Error: {e}"));
-                bg_state.a2a_tasks.update_task(&bg_task_id, |t| {
+                bg_state.a2a_tasks.update_task(&bg_task_id, |t: &mut Task| {
                     t.add_message(error_msg.clone());
                     t.set_status(TaskStatus::Failed);
                 });
