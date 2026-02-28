@@ -143,7 +143,19 @@ Examples:
         /// Telegram identity to allow (username without '@' or numeric user ID)
         identity: String,
     },
+
+    /// List configured A2A peers
+    #[command(long_about = "\
+List all configured A2A peers.
+
+Displays a table of peers with their IDs, endpoints, enabled status,
+and connection status (if available).
+
+Examples:
+  zeroclaw channel list-a2a-peers")]
+    ListA2aPeers,
 }
+
 
 /// Skills management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

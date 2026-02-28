@@ -1,0 +1,7 @@
+{
+  "last_failure": "2026-02-28T01:42:01.236547+01:00",
+  "failure_count": 2,
+  "backoff_until": "2026-02-28T01:43:01.236548+01:00",
+  "needs_manual_sync": false,
+  "failure_reason": "git pull failed: exit status 1\nfatal: 'origin' does not appear to be a git repository\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n"
+}
