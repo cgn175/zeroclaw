@@ -144,6 +144,9 @@ pub struct A2AChannel {
     http_client: reqwest::Client,
     peers: HashMap<String, A2APeer>,
     reconnect_config: ReconnectConfig,
+    /// Sender for pushing received messages (responses from peers) into the message bus.
+    /// Set when `listen()` is called.
+    response_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ChannelMessage>>>>,
 }
 
 impl A2AChannel {
@@ -184,6 +187,7 @@ impl A2AChannel {
             http_client,
             peers,
             reconnect_config,
+            response_tx: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -193,6 +197,9 @@ impl A2AChannel {
     }
 
     /// Send a message to a peer.
+    ///
+    /// After sending, subscribes to the task's SSE stream to receive the response
+    /// back as a `ChannelMessage` through the message bus.
     ///
     /// # Arguments
     ///
@@ -219,122 +226,195 @@ impl A2AChannel {
             anyhow::bail!("Failed to send message: HTTP {} - {}", status, text);
         }
 
+        // Parse response to get task_id for SSE subscription
+        let resp_body: serde_json::Value = response.json().await?;
+        let task_id = resp_body
+            .get("task")
+            .and_then(|t| t.get("id"))
+            .and_then(|id| id.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        if task_id.is_empty() {
+            tracing::warn!("A2A send to {} succeeded but no task_id in response", message.recipient);
+            return Ok(());
+        }
+
+        tracing::info!("A2A task {} created on peer {}", task_id, message.recipient);
+
+        // Spawn SSE subscriber if response_tx is available (listen() has been called)
+        let tx_guard = self.response_tx.lock().await;
+        if let Some(ref tx) = *tx_guard {
+            let peer_id = peer.id.clone();
+            let peer_endpoint = peer.endpoint.clone();
+            let peer_token = peer.bearer_token.clone();
+            let http_client = self.http_client.clone();
+            let tx = tx.clone();
+
+            tokio::spawn(async move {
+                Self::subscribe_to_task_response(
+                    peer_id,
+                    peer_endpoint,
+                    peer_token,
+                    task_id,
+                    http_client,
+                    tx,
+                )
+                .await;
+            });
+        }
+
         Ok(())
+    }
+
+    /// Subscribe to a peer's task SSE stream and forward responses as ChannelMessages.
+    async fn subscribe_to_task_response(
+        peer_id: String,
+        peer_endpoint: String,
+        peer_token: String,
+        task_id: String,
+        http_client: reqwest::Client,
+        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+    ) {
+        let stream_url = format!("{}/tasks/{}/stream", peer_endpoint, task_id);
+        tracing::debug!("Subscribing to A2A task response: {} from peer {}", task_id, peer_id);
+
+        let response = match http_client
+            .get(&stream_url)
+            .bearer_auth(&peer_token)
+            .header("Accept", "text/event-stream")
+            .timeout(Duration::from_secs(300)) // 5 min timeout for long tasks
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => resp,
+            Ok(resp) => {
+                tracing::warn!(
+                    "A2A task stream returned HTTP {} for task {} from peer {}",
+                    resp.status(), task_id, peer_id
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to connect to A2A task stream for task {} from peer {}: {}",
+                    task_id, peer_id, e
+                );
+                return;
+            }
+        };
+
+        let mut buffer = String::new();
+        let mut stream = response.bytes_stream();
+
+        while let Some(chunk) = stream.next().await {
+            let data = match chunk {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("A2A SSE stream error for task {}: {}", task_id, e);
+                    break;
+                }
+            };
+
+            let text = String::from_utf8_lossy(&data);
+            buffer.push_str(&text);
+
+            // Process complete SSE events (separated by double newline)
+            while let Some(event_end) = buffer.find("\n\n") {
+                let event_block = buffer[..event_end].to_string();
+                buffer = buffer[event_end + 2..].to_string();
+
+                for line in event_block.lines() {
+                    if let Some(data_str) = line.strip_prefix("data: ") {
+                        if let Ok(update) = serde_json::from_str::<crate::protocol::TaskUpdate>(data_str) {
+                            // Convert TaskUpdate message to ChannelMessage
+                            if let Some(ref msg) = update.message {
+                                let channel_msg = ChannelMessage {
+                                    id: format!("{}-{}", task_id, current_timestamp_secs()),
+                                    sender: peer_id.clone(),
+                                    reply_target: peer_id.clone(),
+                                    content: msg.content.clone(),
+                                    channel: "a2a".to_string(),
+                                    timestamp: current_timestamp_secs(),
+                                    thread_ts: Some(task_id.clone()),
+                                };
+                                if tx.send(channel_msg).await.is_err() {
+                                    tracing::warn!("A2A response channel closed for task {}", task_id);
+                                    return;
+                                }
+                            }
+
+                            // Stop on terminal states
+                            if matches!(
+                                update.status,
+                                crate::protocol::TaskStatus::Completed
+                                    | crate::protocol::TaskStatus::Failed
+                                    | crate::protocol::TaskStatus::Cancelled
+                            ) {
+                                tracing::debug!(
+                                    "A2A task {} from peer {} finished: {:?}",
+                                    task_id, peer_id, update.status
+                                );
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Listen for incoming messages from peers.
     ///
-    /// This connects to SSE streams from all configured peers.
+    /// Stores the message sender for use by `send()` response subscribers,
+    /// then runs a health-monitoring loop. Actual response messages are received
+    /// via per-task SSE subscribers spawned by `send()`.
     pub async fn listen(
         &self,
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> anyhow::Result<()> {
-        let peer_connections: Arc<Mutex<HashMap<String, PeerConnection>>> = Arc::new(Mutex::new(
-            self.peers
-                .values()
-                .map(|p| (p.id.clone(), PeerConnection::new(p.clone())))
-                .collect(),
-        ));
-
-        loop {
-            for peer_id in self.peers.keys() {
-                let mut connections = peer_connections.lock().await;
-                let connection = connections.get_mut(peer_id).unwrap();
-
-                match connection.state {
-                    PeerState::Connected | PeerState::Connecting => continue,
-                    PeerState::Failed => {
-                        // Try recovery after health check interval
-                        if let Some(last_connected) = connection.last_connected {
-                            let elapsed = current_timestamp_secs() - last_connected;
-                            if elapsed < self.config.reconnect.health_check_interval_secs {
-                                continue;
-                            }
-                        }
-                        connection.mark_ready_for_reconnect();
-                    }
-                    PeerState::Disconnected => {
-                        connection.state = PeerState::Connecting;
-                    }
-                }
-
-                let peer = connection.peer.clone();
-                let reconnect_config = self.reconnect_config.clone();
-                let http_client = self.http_client.clone();
-                let tx = tx.clone();
-                let connections = peer_connections.clone();
-
-                tokio::spawn(async move {
-                    if let Err(e) =
-                        Self::connect_to_peer_stream(peer, reconnect_config, http_client, tx, connections).await
-                    {
-                        tracing::warn!("A2A peer stream error: {}", e);
-                    }
-                });
-            }
-
-            tokio::time::sleep(Duration::from_secs(1)).await;
+        // Store tx so send() can spawn response subscribers
+        {
+            let mut response_tx = self.response_tx.lock().await;
+            *response_tx = Some(tx.clone());
         }
-    }
 
-    /// Connect to a peer's SSE stream.
-    async fn connect_to_peer_stream(
-        peer: A2APeer,
-        reconnect_config: ReconnectConfig,
-        http_client: reqwest::Client,
-        _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        connections: Arc<Mutex<HashMap<String, PeerConnection>>>,
-    ) -> anyhow::Result<()> {
-        let stream_url = format!("{}/tasks/stream", peer.endpoint);
+        tracing::info!(
+            "A2A channel listening with {} peer(s). Responses handled via per-task SSE subscribers.",
+            self.peers.len()
+        );
 
+        // Keep alive — periodic health checks on peers.
+        // The actual message receiving happens via:
+        // 1. Gateway (handle_create_task) for incoming tasks FROM peers
+        // 2. Per-task SSE subscribers spawned by send() for responses TO our tasks
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
-            let mut connection = connections.lock().await;
-            let conn = connection.get_mut(&peer.id).unwrap();
+            interval.tick().await;
 
-            if conn.retry_count >= reconnect_config.max_retries {
-                conn.mark_failed();
-                anyhow::bail!("Max retries exceeded for peer {}", peer.id);
+            if tx.is_closed() {
+                tracing::info!("A2A listen channel closed, stopping");
+                break;
             }
 
-            let attempt = conn.increment_retry();
-            drop(connection);
-
-            let delay = calculate_backoff_delay(attempt, &reconnect_config);
-            tokio::time::sleep(delay).await;
-
-            match http_client
-                .get(&stream_url)
-                .bearer_auth(&peer.bearer_token)
-                .send()
-                .await
-            {
-                Ok(response) => {
-                    if response.status().is_success() {
-                        let mut connection = connections.lock().await;
-                        connection.get_mut(&peer.id).unwrap().mark_connected();
-                        drop(connection);
-
-                        let mut stream = response.bytes_stream();
-                        while let Some(chunk) = stream.next().await {
-                            if let Ok(_data) = chunk {
-                                // TODO: Parse SSE events and send ChannelMessage
-                                // For now, just keep connection alive
-                            }
-                        }
-
-                        let mut connection = connections.lock().await;
-                        connection.get_mut(&peer.id).unwrap().mark_disconnected();
+            // Periodic health check
+            for peer in self.peers.values() {
+                let url = format!("{}/.well-known/agent.json", peer.endpoint);
+                match self.http_client.get(&url).send().await {
+                    Ok(response) if response.status().is_success() => {
+                        tracing::debug!("A2A peer {} healthy", peer.id);
                     }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "A2A stream connection failed for peer {}: {}",
-                        peer.id,
-                        e
-                    );
+                    Ok(response) => {
+                        tracing::debug!("A2A peer {} health check: HTTP {}", peer.id, response.status());
+                    }
+                    Err(e) => {
+                        tracing::debug!("A2A peer {} health check error: {}", peer.id, e);
+                    }
                 }
             }
         }
+
+        Ok(())
     }
 
     /// Perform a health check on all peers.
@@ -445,5 +525,55 @@ mod tests {
         conn.mark_ready_for_reconnect();
         assert_eq!(conn.state, PeerState::Disconnected);
         assert_eq!(conn.retry_count, 0);
+    }
+
+    #[tokio::test]
+    async fn subscribe_parses_task_update_into_channel_message() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(10);
+
+        // Simulate what subscribe_to_task_response does: parse SSE data into ChannelMessage
+        let sse_data = r#"{"task_id":"task-123","status":"running","message":{"role":"agent","content":"Here is the code review result.","timestamp":"2024-01-01T00:00:00Z"}}"#;
+        let update: crate::protocol::TaskUpdate = serde_json::from_str(sse_data).unwrap();
+
+        assert!(update.message.is_some());
+        assert_eq!(update.message.as_ref().unwrap().content, "Here is the code review result.");
+        assert_eq!(update.status, crate::protocol::TaskStatus::Running);
+
+        if let Some(ref msg) = update.message {
+            let channel_msg = ChannelMessage {
+                id: "task-123-1234567890".to_string(),
+                sender: "peer-reviewer".to_string(),
+                reply_target: "peer-reviewer".to_string(),
+                content: msg.content.clone(),
+                channel: "a2a".to_string(),
+                timestamp: 1234567890,
+                thread_ts: Some("task-123".to_string()),
+            };
+            tx.send(channel_msg).await.unwrap();
+        }
+
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.content, "Here is the code review result.");
+        assert_eq!(received.sender, "peer-reviewer");
+        assert_eq!(received.channel, "a2a");
+        assert_eq!(received.thread_ts, Some("task-123".to_string()));
+    }
+
+    #[test]
+    fn task_update_terminal_states_detected() {
+        let completed: crate::protocol::TaskUpdate = serde_json::from_str(
+            r#"{"task_id":"t1","status":"completed"}"#
+        ).unwrap();
+        assert!(matches!(completed.status, crate::protocol::TaskStatus::Completed));
+
+        let failed: crate::protocol::TaskUpdate = serde_json::from_str(
+            r#"{"task_id":"t2","status":"failed"}"#
+        ).unwrap();
+        assert!(matches!(failed.status, crate::protocol::TaskStatus::Failed));
+
+        let cancelled: crate::protocol::TaskUpdate = serde_json::from_str(
+            r#"{"task_id":"t3","status":"cancelled"}"#
+        ).unwrap();
+        assert!(matches!(cancelled.status, crate::protocol::TaskStatus::Cancelled));
     }
 }
