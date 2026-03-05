@@ -149,21 +149,49 @@ let router = build_a2a_routes(state);
 
 ## AGENTS.md — Teaching Agents to Talk
 
-Add inter-agent instructions to your agent's `AGENTS.md` workspace file (injected into the system prompt automatically):
+Add inter-agent instructions to your agent's `AGENTS.md` workspace file (injected into the system prompt automatically).
+
+### How Agent Communication Works
+
+Agents receive A2A messages through the **gateway** — when a peer (or the portal) sends a `POST /tasks` to this agent, the `GatewayDispatcher` processes it through the full agent loop. So **inbound** communication works automatically.
+
+For **outbound** communication (agent initiates a message to a peer), agents use the `http_request` tool to POST to the portal's A2A endpoint. The portal then routes it to the target agent.
+
+### Example AGENTS.md
 
 ```markdown
-## Available Peers
+## Inter-Agent Communication
 
-- **senior-reviewer** — Ask for code reviews, architecture advice
-- **junior-dev** — Delegate implementation tasks
+You can talk to other agents through the portal's A2A protocol.
 
-## How to Communicate
+### Available Peers
 
-Send a message using the A2A channel with the peer's agent ID as the recipient.
-Messages are asynchronous — the response arrives as a new message in your conversation.
-Your memory automatically saves context, so you'll remember what you asked for.
-Only communicate when you genuinely need another agent's expertise.
+- **senior-reviewer** (agent ID: `senior-reviewer`) — Code reviews, architecture advice
+- **junior-dev** (agent ID: `junior-dev`) — Delegate implementation tasks
+
+### How to Send a Message
+
+Use the `http_request` tool to POST to the portal:
+
+- **URL**: `http://host.docker.internal:8080/tasks`
+- **Method**: POST
+- **Headers**: `{"Authorization": "Bearer <your-portal-token>", "X-Channel-ID": "<your-id>::<target-id>"}`
+- **Body**: `{"message": {"role": "user", "content": "Your message here"}}`
+
+Example: To ask senior-reviewer for a code review:
+- URL: http://host.docker.internal:8080/tasks
+- Method: POST
+- Headers: Authorization: Bearer YOUR_TOKEN, X-Channel-ID: your-id::senior-reviewer
+- Body: {"message": {"role": "user", "content": "Please review this code: ..."}}
+
+### Important Notes
+
+- Messages are **asynchronous**. The response arrives as a new inbound task.
+- Your **memory** automatically saves conversations for context continuity.
+- Only communicate when you genuinely need another agent's expertise.
 ```
+
+> **Note:** The `http_request` tool requires `host.docker.internal` (or the portal's hostname) to be in the agent's `allowed_domains` config. Alternatively, agents can use the `shell` tool with `curl`.
 
 ## License
 

@@ -15,6 +15,7 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
+pub mod a2a_send;
 pub mod agents_ipc;
 pub mod apply_patch;
 pub mod browser;
@@ -72,6 +73,7 @@ pub mod wasm_tool;
 pub mod web_fetch;
 pub mod web_search_tool;
 
+pub use a2a_send::A2aSendTool;
 pub use apply_patch::ApplyPatchTool;
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
@@ -533,6 +535,11 @@ pub fn all_tools_with_runtime(
                 tracing::warn!("agents_ipc: failed to open IPC database: {e}");
             }
         }
+    }
+
+    // A2A send tool — available when A2A channel is configured
+    if root_config.channels_config.a2a.as_ref().is_some_and(|a| a.enabled) {
+        tool_arcs.push(Arc::new(A2aSendTool::new()));
     }
 
     // Load WASM plugin tools from the skills directory.
