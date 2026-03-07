@@ -539,7 +539,7 @@ pub fn all_tools_with_runtime(
 
     // A2A send tool — available when A2A channel is configured
     if root_config.channels_config.a2a.as_ref().is_some_and(|a| a.enabled) {
-        tool_arcs.push(Arc::new(A2aSendTool::new()));
+        tool_arcs.push(Arc::new(A2aSendTool::new(config.clone())));
     }
 
     // Load WASM plugin tools from the skills directory.
