@@ -50,6 +50,7 @@ Last refreshed: **February 25, 2026**.
 - [zai-glm-setup.md](zai-glm-setup.md)
 - [langgraph-integration.md](langgraph-integration.md)
 - [proxy-agent-playbook.md](proxy-agent-playbook.md)
+- [tools/pi-agent.md](tools/pi-agent.md)
 
 ### 3) Operations & Deployment
 

@@ -283,6 +283,10 @@ pub struct Config {
     /// WASM plugin engine configuration (`[wasm]` section).
     #[serde(default)]
     pub wasm: WasmConfig,
+
+    /// Pi coding agent tool configuration (`[pi_agent]`).
+    #[serde(default)]
+    pub pi_agent: PiAgentConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -829,6 +833,24 @@ impl Default for WasmConfig {
             fuel_limit: default_wasm_fuel_limit(),
             registry_url: default_registry_url(),
         }
+    }
+}
+
+/// Pi coding agent tool configuration (`[pi_agent]` section).
+///
+/// When enabled, registers a `pi_coding_agent` tool that spawns the
+/// `pi` CLI (<https://pi.dev>) to handle complex coding tasks as a
+/// sub-agent. Requires `pi` to be installed and on `$PATH`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PiAgentConfig {
+    /// Enable the pi coding agent tool. Default: `false` (opt-in).
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl Default for PiAgentConfig {
+    fn default() -> Self {
+        Self { enabled: false }
     }
 }
 
@@ -5095,6 +5117,7 @@ impl Default for Config {
             mcp: McpConfig::default(),
             model_support_vision: None,
             wasm: WasmConfig::default(),
+            pi_agent: PiAgentConfig::default(),
         }
     }
 }

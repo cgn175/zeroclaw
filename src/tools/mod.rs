@@ -54,6 +54,7 @@ pub mod memory_recall;
 pub mod memory_store;
 pub mod model_routing_config;
 pub mod pdf_read;
+pub mod pi_agent;
 pub mod process;
 pub mod proxy_config;
 pub mod pushover;
@@ -108,6 +109,7 @@ pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use model_routing_config::ModelRoutingConfigTool;
 pub use pdf_read::PdfReadTool;
+pub use pi_agent::PiAgentTool;
 pub use process::ProcessTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
@@ -299,6 +301,21 @@ pub fn all_tools_with_runtime(
             runtime.clone(),
             Some(syscall_detector),
         )));
+        if root_config.pi_agent.enabled {
+            tool_arcs.push(Arc::new(PiAgentTool::new(
+                security.clone(),
+                root_config
+                    .default_provider
+                    .clone()
+                    .unwrap_or_default(),
+                root_config
+                    .default_model
+                    .clone()
+                    .unwrap_or_default(),
+                root_config.api_key.clone(),
+                root_config.api_url.clone(),
+            )));
+        }
         tool_arcs.push(Arc::new(GitOperationsTool::new(
             security.clone(),
             workspace_dir.to_path_buf(),
