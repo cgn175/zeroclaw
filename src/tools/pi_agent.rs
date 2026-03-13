@@ -220,6 +220,14 @@ impl Tool for PiAgentTool {
         // Build command. Use print mode for clean text output.
         let mut cmd = Command::new("pi");
         cmd.arg("-p").arg(task).current_dir(&work_dir);
+        
+        tracing::info!(
+            task = %task,
+            provider = %self.provider,
+            model = %self.model,
+            cwd = %work_dir.display(),
+            "Invoking pi agent"
+        );
 
         // Clear the environment to prevent leaking API keys and secrets
         // (CWE-200), then re-add only safe, functional variables.
@@ -269,6 +277,20 @@ impl Tool for PiAgentTool {
             Ok(Ok(output)) => {
                 let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+                tracing::info!(
+                    exit_code = %output.status,
+                    stdout_len = stdout.len(),
+                    stderr_len = stderr.len(),
+                    "Pi agent completed"
+                );
+
+                if !stdout.is_empty() {
+                    tracing::debug!(stdout = %stdout, "Pi agent stdout");
+                }
+                if !stderr.is_empty() {
+                    tracing::debug!(stderr = %stderr, "Pi agent stderr");
+                }
 
                 if stdout.len() > MAX_OUTPUT_BYTES {
                     stdout.truncate(crate::util::floor_utf8_char_boundary(
